@@ -32,7 +32,7 @@ def get_pkgs
 
     pkg_shell = ShellDoer.new("~")
     pkg_shell.>(%q{
-        sudo apt-get install gawk liblua5.1-0-dev libntl-dev         \
+        sudo apt-get install -y gawk liblua5.1-0-dev libntl-dev         \
                 libmysqlclient-dev libssl-dev libbsd-dev        \
                 libevent-dev libglib2.0-dev libgmp-dev          \
                 mysql-server libaio-dev automake                \
