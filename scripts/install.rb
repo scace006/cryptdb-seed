@@ -148,7 +148,7 @@ def fn(cdb_path, in_make_v=nil, in_gcc_v=nil)
     cryptdb_shell.>("mkdir #{shadow_path}")
 
     # Give the user access to all the stuff we created.
-    cryptdb_shell.>("chown -R #{Etc.getlogin} #{cryptdb_path}")
+    cryptdb_shell.>("chown -R root #{cryptdb_path}")
 end
 
 class ShellDoer
