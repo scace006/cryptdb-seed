@@ -37,10 +37,7 @@ def get_pkgs
                 libevent-dev libglib2.0-dev libgmp-dev                          \
                 mysql-server libaio-dev automake                                \
                 gtk-doc-tools flex cmake libncurses5-dev                        \
-                g++ make lua5.1 cscope;                                         \
-                apt-get remove bison libbison-dev -y;                           \
-                cd packages; sudo dpkg -i libbison-dev_2.7.1.dfsg-1_amd64.dev;  \
-                sudo dpkg -i bison_2.7.1.dfsg-1_amd64.dev; cd .. 
+                g++ make lua5.1 cscope;                                         
     })
 end
 
