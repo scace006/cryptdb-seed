@@ -40,8 +40,10 @@ function do_install() {
 
         # Even after backup, keep all data there, but files with
         # the same name will be overwritten.
-        echo -n "[!] DocumentRoot directory $docroot is not empty. Backup data? [Y/n]: "
-        read opt
+        # echo -n "[!] DocumentRoot directory $docroot is not empty. Backup data? [Y/n]: "
+        # read opt
+        # dont back up rood
+        opt = "n"
 
         if [ "$opt" != "n" ] ; then
             cd `dirname $docroot`
