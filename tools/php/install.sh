@@ -6,7 +6,7 @@
 #
 # See INSTALL for instructions
 
-apache2="/etc/apache2/sites-enabled/000-default"
+apache2="/etc/apache2/sites-enabled/000-default.conf"
 declare -a files=(./index.php ./common.php ./select.php ./favicon.ico menu_assets)
 
 function do_install() {
