@@ -9,6 +9,6 @@ apt-get install -y apache2 \
         apache2-utils apache2.2-bin \
         libapache2-mod-php5 \
         php5-cli php5-common php5-mysql \
-        && cd ./tools/php && ./install.sh \
+        && cd ./tools/php && ./install.sh -n \
         && service apache2 restart \
         && cd ../..
