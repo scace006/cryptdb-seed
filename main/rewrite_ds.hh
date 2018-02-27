@@ -5,6 +5,7 @@
 #include <memory>
 
 #include <util/onions.hh>
+#include <parser/sql_utils.hh>
 
 class FieldMeta;
 /**
@@ -168,11 +169,11 @@ class reason {
 public:
     reason(const EncSet &es, const std::string &why,
            const Item &item)
-        : encset(es), why(why), item(item) {}
+        : encset(es), why(why), string_item(printItemToString(item)) {}
 
     const EncSet encset;
     const std::string why;
-    const Item &item;
+    const std::string string_item;
 };
 
 std::ostream&
@@ -188,6 +189,7 @@ public:
     EncSet es_out; // encset that this item can output
 
     RewritePlan(const EncSet &es, reason r) : r(r), es_out(es) {};
+    virtual ~RewritePlan() {}
     reason getReason() const {return r;}
 
     //only keep plans that have parent_olk in es
@@ -195,9 +197,19 @@ public:
 
 };
 
+class RewritePlanWithChildren : public RewritePlan {
+public:
+    std::vector<std::shared_ptr<RewritePlan> > childr_rp;
+
+    RewritePlanWithChildren(const EncSet &es_out, const reason &r,
+                            const std::vector<std::shared_ptr<RewritePlan> >
+                                &childr_rp)
+        : RewritePlan(es_out, r), childr_rp(childr_rp) {}
+};
+
 //rewrite plan in which we only need to remember one olk
 // to know how to rewrite
-class RewritePlanOneOLK: public RewritePlan {
+class RewritePlanOneOLK : public RewritePlan {
 public:
     const OLK olk;
     // the following store how to rewrite children
@@ -208,6 +220,7 @@ public:
                         &childr_rp, reason r)
         : RewritePlan(es_out, r), olk(olk),
           childr_rp(childr_rp) {}
+    ~RewritePlanOneOLK() {}
 };
 
 class RewritePlanPerChildOLK : public RewritePlan {
@@ -219,6 +232,7 @@ public:
                 const std::vector<std::pair<std::shared_ptr<RewritePlan>,
                                           OLK>> &child_olks, reason r)
         : RewritePlan(es_out, r), child_olks(child_olks) {}
+    ~RewritePlanPerChildOLK() {}
 };
 
 class RewritePlanWithAnalysis : public RewritePlan {
@@ -226,6 +240,7 @@ public:
     const std::unique_ptr<Analysis> a;
     RewritePlanWithAnalysis(const EncSet &es_out, reason r,
                             std::unique_ptr<Analysis> a);
+    ~RewritePlanWithAnalysis();
 };
 
 std::ostream&

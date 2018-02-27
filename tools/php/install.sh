@@ -6,7 +6,7 @@
 #
 # See INSTALL for instructions
 
-apache2="/etc/apache2/sites-available/000-default.conf"
+apache2="/etc/apache2/sites-enabled/000-default"
 declare -a files=(./index.php ./common.php ./select.php ./favicon.ico menu_assets)
 
 function do_install() {
@@ -36,23 +36,20 @@ function do_install() {
     
     # Installing...
     total=$(ls -l $docroot |head -1| awk '{print $2}')
-    
-    # skip
-    # if [ $total -gt 0 ] ; then
+    if [ $total -gt 0 ] ; then
 
-    #     # Even after backup, keep all data there, but files with
-    #     # the same name will be overwritten.
-    #     echo -n "[!] DocumentRoot directory $docroot is not empty. Backup data? [Y/n]: "
-    #     read opt
-    #     # dont back up rood
+        # Even after backup, keep all data there, but files with
+        # the same name will be overwritten.
+        echo -n "[!] DocumentRoot directory $docroot is not empty. Backup data? [Y/n]: "
+        read opt
 
-    #     if [ "$opt" != "n" ] ; then
-    #         cd `dirname $docroot`
-    #         currtime=$(date +"%m-%d-%Y_%H:%M")
-    #         tar -vcjf $currdir/www-bkp-$currtime.tar.bz2 `basename $docroot`
-    #         cd - >/dev/null
-    #     fi
-    # fi
+        if [ "$opt" != "n" ] ; then
+            cd `dirname $docroot`
+            currtime=$(date +"%m-%d-%Y_%H:%M")
+            tar -vcjf $currdir/www-bkp-$currtime.tar.bz2 `basename $docroot`
+            cd - >/dev/null
+        fi
+    fi
 
     a=0
     while : ; do 

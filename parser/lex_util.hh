@@ -37,6 +37,7 @@ Item_func *dup_item(const Item_func &i);
 Item_decimal *dup_item(const Item_decimal &i);
 Item *dup_item(const Item &i);
 Item_float *dup_item(const Item_float &i);
+Item_field *dup_item(const Item_field &i);
 
 Item_field *make_item_field(const Item_field &t,
                             const std::string &table_name = "",

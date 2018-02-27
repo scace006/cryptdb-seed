@@ -103,7 +103,7 @@ decrypt_SEM(const unsigned char *const eValueBytes, uint64_t eValueLen,
     std::string c(reinterpret_cast<const char *>(eValueBytes),
                   static_cast<unsigned int>(eValueLen));
     return decrypt_AES_CBC(c, aesKey, BytesFromInt(salt, SALT_LEN_BYTES),
-                           false);
+                           true);
 }
 
 
@@ -211,10 +211,9 @@ my_bool
 cryptdb_decrypt_int_det_init(UDF_INIT *const initid, UDF_ARGS *const args,
                              char *const message)
 {
-    if (args->arg_count != 3 ||
+    if (args->arg_count != 2 ||
         args->arg_type[0] != INT_RESULT ||
-        args->arg_type[1] != STRING_RESULT ||
-        args->arg_type[2] != INT_RESULT)
+        args->arg_type[1] != STRING_RESULT)
     {
         strcpy(message, "Usage: cryptdb_decrypt_int_det(int ciphertext, string key)");
         return 1;
@@ -240,16 +239,13 @@ cryptdb_decrypt_int_det(UDF_INIT *const initid, UDF_ARGS *const args,
             char *const keyBytes = getba(args, 1, keyLen);
             const std::string key = std::string(keyBytes, keyLen);
 
-            const uint64_t shift = getui(args, 2);
-
             blowfish bf(key);
-            value = bf.decrypt(eValue) - shift;
+            value = bf.decrypt(eValue);
         } catch (const CryptoError &e) {
             std::cerr << e.msg << std::endl;
             value = 0;
         }
     }
-
 
     return static_cast<ulonglong>(value.get());
 }
@@ -300,9 +296,9 @@ cryptdb_decrypt_text_sem(UDF_INIT *const initid, UDF_ARGS *const args,
 
             uint64_t keyLen;
             char *const keyBytes = getba(args, 1, keyLen);
-            const std::string key = std::string(keyBytes, keyLen);
+            const std::string &key = std::string(keyBytes, keyLen);
 
-            uint64_t salt = getui(args, 2);
+            const uint64_t salt = getui(args, 2);
 
             const std::unique_ptr<AES_KEY> aesKey(get_AES_dec_key(key));
             value =
@@ -572,7 +568,7 @@ cryptdb_func_add_set(UDF_INIT *const initid, UDF_ARGS *const args,
 
     AssignOnce<uint64_t> out_len;
     ZZ res;
-    if (NULL == args->args[0]) {
+    if (NULL == args->args[0] || NULL == args->args[1]) {
         out_len = 0;
         *is_null = 1;
         res = 0;

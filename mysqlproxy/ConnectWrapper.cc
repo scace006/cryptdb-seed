@@ -6,15 +6,23 @@
 #include <util/ctr.hh>
 #include <util/cryptdb_log.hh>
 #include <util/scoped_lock.hh>
+#include <util/util.hh>
 
 #include <main/rewrite_main.hh>
 #include <main/rewrite_util.hh>
-#include <parser/sql_utils.hh>
+#include <main/schema.hh>
+#include <main/Analysis.hh>
 
-// FIXME: Ownership semantics.
+#include <parser/sql_utils.hh>
+#include <parser/mysql_type_metadata.hh>
+
+__thread ProxyState *thread_ps = NULL;
+
 class WrapperState {
     WrapperState(const WrapperState &other);
     WrapperState &operator=(const WrapperState &rhs);
+
+    KillZone kill_zone;
 
 public:
     std::string last_query;
@@ -24,25 +32,57 @@ public:
     WrapperState() {}
     ~WrapperState() {}
 
-    SchemaCache &getSchemaCache() {return schema_cache;}
     const std::unique_ptr<QueryRewrite> &getQueryRewrite() const {
         assert(this->qr);
         return this->qr;
     }
-    void setQueryRewrite(QueryRewrite *const in_qr) {
-        // assert(!this->qr);
-        this->qr = std::unique_ptr<QueryRewrite>(in_qr);
+    void setQueryRewrite(std::unique_ptr<QueryRewrite> &&in_qr) {
+        this->qr = std::move(in_qr);
     }
+    void selfKill(KillZone::Where where) {
+        kill_zone.die(where);
+    }
+    void setKillZone(const KillZone &kz) {
+        kill_zone = kz;
+    }
+
+    std::unique_ptr<ProxyState> ps;
+    // we are running cryptdb in a threaded environment without proper
+    // locking; this leads to crashes during onion adjustment unless we
+    // take some minimal precautions
+    // > everytime we process a query we take a reference to the SchemaInfo
+    //   so that we know the same SchemaInfo (and it's children) will be
+    //   available on the backend for Deltaz; this handles the following
+    //   known bad cases.
+    //   a. thread A marks the cache as stale; thread B sees that it is
+    //      stale and updates the cache; thread A crashes while
+    //      trying to do onion adjustment
+    //   b. we must take the reference at the same time we get the schema
+    //      from the cache, otherwise ...
+    //      + thread A takes the reference to SchemaInfo when the cache is
+    //        already stale, now he ``gets'' his SchemaInfo; because the
+    //        cache is stale the second SchemaInfo is a new object and the
+    //        reference doesn't protect it. now when thread B gets his
+    //        SchemaInfo the cache is still stale so he deletes the only
+    //        reference to the SchemaInfo thread A is using
+    //      + this case only applies if we aren't using the lock on each
+    //        function (connect, disonnect, rewrite, envoi); thread A
+    //        takes a reference to SchemaInfo then before he can ``get''
+    //        the SchemaInfo thread B stales the cache. now thread A
+    //        gets the SchemaInfo and his reference doesn't protect it.
+    //        when thread C gets his SchemaInfo the cache is stale so
+    //        he deletes the only reference to the SchemaInfo thread A
+    //        is using
+    std::vector<SchemaInfoRef> schema_info_refs;
 
 private:
     std::unique_ptr<QueryRewrite> qr;
-    SchemaCache schema_cache;
 };
 
 static Timer t;
 
 //static EDBProxy * cl = NULL;
-static ProxyState * ps = NULL;
+static SharedProxyState * shared_ps = NULL;
 static pthread_mutex_t big_lock;
 
 static bool EXECUTE_QUERIES = true;
@@ -57,49 +97,8 @@ static int counter = 0;
 
 static std::map<std::string, WrapperState*> clients;
 
-static int
+static void
 returnResultSet(lua_State *L, const ResType &res);
-
-static Item *
-make_item_by_type(const std::string &value, enum_field_types type)
-{
-    Item * i;
-
-    switch(type) {
-    case MYSQL_TYPE_SHORT:
-    case MYSQL_TYPE_LONG:
-    case MYSQL_TYPE_LONGLONG:
-    case MYSQL_TYPE_INT24:
-    case MYSQL_TYPE_TINY:
-        i = new (current_thd->mem_root) Item_int(static_cast<long long>(valFromStr(value)));
-        break;
-
-    case MYSQL_TYPE_DOUBLE:
-        i = new (current_thd->mem_root) Item_float(value.c_str(),
-                                                   value.size());
-        break;
-
-    case MYSQL_TYPE_BLOB:
-    case MYSQL_TYPE_TINY_BLOB:
-    case MYSQL_TYPE_MEDIUM_BLOB:
-    case MYSQL_TYPE_LONG_BLOB:
-    case MYSQL_TYPE_VARCHAR:
-    case MYSQL_TYPE_VAR_STRING:
-    case MYSQL_TYPE_TIMESTAMP:
-    case MYSQL_TYPE_DATE:
-    case MYSQL_TYPE_NEWDATE:
-    case MYSQL_TYPE_TIME:
-    case MYSQL_TYPE_DATETIME:
-        i = new (current_thd->mem_root) Item_string(make_thd_string(value),
-                                                    value.length(),
-                                                    &my_charset_bin);
-        break;
-
-    default:
-        thrower() << "unknown data type " << type;
-    }
-    return i;
-}
 
 static Item_null *
 make_null(const std::string &name = "")
@@ -125,6 +124,8 @@ xlua_pushlstring(lua_State *const l, const std::string &s)
 static int
 connect(lua_State *const L)
 {
+    assert(test64bitZZConversions());
+
     ANON_REGION(__func__, &perf_cg);
     scoped_lock l(&big_lock);
     assert(0 == mysql_thread_init());
@@ -138,14 +139,11 @@ connect(lua_State *const L)
 
     ConnectionInfo const ci = ConnectionInfo(server, user, psswd, port);
 
-    if (clients.find(client) != clients.end()) {
-           LOG(warn) << "duplicate client entry";
-    }
-
+    assert(clients.end() == clients.find(client));
     clients[client] = new WrapperState();
 
     // Is it the first connection?
-    if (!ps) {
+    if (!shared_ps) {
         std::cerr << "starting proxy\n";
         //cryptdb_logger::setConf(string(getenv("CRYPTDB_LOG")?:""));
 
@@ -154,23 +152,15 @@ connect(lua_State *const L)
                      << "user = " << user << "; "
                      << "password = " << psswd;
 
-        std::string const false_str = "FALSE";
-        const std::string dbname = "cryptdbtest";
-        const std::string mkey = "113341234";  // XXX do not change as
-                                               // it's used for tpcc exps
-        const char * ev = getenv("ENC_BY_DEFAULT");
-        if (ev && equalsIgnoreCase(false_str, ev)) {
-            std::cerr << "\n\n enc by default false " << "\n\n";
-            ps = new ProxyState(ci, embed_dir, mkey,
-                                SECURITY_RATING::PLAIN);
-        } else {
-            std::cerr << "\n\nenc by default true" << "\n\n";
-            ps = new ProxyState(ci, embed_dir, mkey,
-                                SECURITY_RATING::BEST_EFFORT);
-        }
+        const std::string &false_str = "FALSE";
+        const std::string &mkey      = "113341234";  // XXX do not change as
+                                                     // it's used for tpcc exps
+        shared_ps =
+            new SharedProxyState(ci, embed_dir, mkey,
+                                 determineSecurityRating());
 
         //may need to do training
-        ev = getenv("TRAIN_QUERY");
+        const char *ev = getenv("TRAIN_QUERY");
         if (ev) {
             std::cerr << "Deprecated query training!" << std::endl;
         }
@@ -223,6 +213,11 @@ connect(lua_State *const L)
             clients[client]->PLAIN_LOG = PLAIN_LOG;
         }
     }
+    clients[client]->ps =
+        std::unique_ptr<ProxyState>(new ProxyState(*shared_ps));
+    // We don't want to use the THD from the previous connection
+    // if such is even possible...
+    clients[client]->ps->safeCreateEmbeddedTHD();
 
     return 0;
 }
@@ -244,12 +239,11 @@ disconnect(lua_State *const L)
     auto ws = clients[client];
     clients[client] = NULL;
 
-    SchemaCache &schema_cache = ws->getSchemaCache();
-    TEST_TextMessageError(schema_cache.cleanupStaleness(ps->getEConn()),
-                          "Failed to cleanup staleness!");
+    thread_ps = NULL;
     delete ws;
     clients.erase(client);
 
+    mysql_thread_end();
     return 0;
 }
 
@@ -262,11 +256,15 @@ rewrite(lua_State *const L)
 
     const std::string client = xlua_tolstring(L, 1);
     if (clients.find(client) == clients.end()) {
-        return 0;
+        lua_pushnil(L);
+        xlua_pushlstring(L, "failed to recognize client");     
+        return 2;
     }
     WrapperState *const c_wrapper = clients[client];
+    ProxyState *const ps = thread_ps = c_wrapper->ps.get();
+    assert(ps);
 
-    const std::string query = xlua_tolstring(L, 2);
+    const std::string &query = xlua_tolstring(L, 2);
     const unsigned long long _thread_id =
         strtoull(xlua_tolstring(L, 3).c_str(), NULL, 10);
 
@@ -276,74 +274,66 @@ rewrite(lua_State *const L)
     t.lap_ms();
     if (EXECUTE_QUERIES) {
         try {
-            assert(ps);
+            TEST_Text(retrieveDefaultDatabase(_thread_id, ps->getConn(),
+                                              &c_wrapper->default_db),
+                      "proxy failed to retrieve default database!");
+            // save a reference so a second thread won't eat objects
+            // that DeltaOuput wants later
+            const std::shared_ptr<const SchemaInfo> &schema =
+                ps->getSchemaInfo();
+            c_wrapper->schema_info_refs.push_back(schema);
 
-            SchemaCache &schema_cache = c_wrapper->getSchemaCache();
-            std::unique_ptr<QueryRewrite> qr;
-            TEST_TextMessageError(retrieveDefaultDatabase(_thread_id,
-                                                          ps->getConn(),
-                                            &c_wrapper->default_db),
-                            "proxy failed to retrieve default database!");
-            queryPreamble(*ps, query, &qr, &new_queries, &schema_cache,
-                          c_wrapper->default_db);
+            std::unique_ptr<QueryRewrite> qr =
+                std::unique_ptr<QueryRewrite>(new QueryRewrite(
+                    Rewriter::rewrite(query, *schema.get(),
+                                      c_wrapper->default_db, *ps)));
             assert(qr);
 
-            c_wrapper->setQueryRewrite(qr.release());
-        } catch (const SynchronizationException &e) {
-            lua_pushboolean(L, false);              // status
-            xlua_pushlstring(L, e.to_string());     // error message
-            lua_pushnil(L);                         // new queries
-            return 3;
+            c_wrapper->setQueryRewrite(std::move(qr));
         } catch (const AbstractException &e) {
             lua_pushboolean(L, false);              // status
             xlua_pushlstring(L, e.to_string());     // error message
-            lua_pushnil(L);                         // new queries
-            return 3;
+            return 2;
         } catch (const CryptDBError &e) {
-            LOG(wrapper) << "cannot rewrite " << query << ": " << e.msg;
             lua_pushboolean(L, false);              // status
             xlua_pushlstring(L, e.msg);             // error message
-            lua_pushnil(L);                         // new queries
-            return 3;
+            return 2;
         }
     }
 
     if (LOG_PLAIN_QUERIES) {
-        *(c_wrapper->PLAIN_LOG) << query << "\n";
+        *(c_wrapper->PLAIN_LOG) << query << std::endl;
     }
 
     lua_pushboolean(L, true);                       // status
     lua_pushnil(L);                                 // error message
 
-    // NOTE: Potentially out of int range.
-    assert(new_queries.size() < INT_MAX);
-    lua_createtable(L, static_cast<int>(new_queries.size()), 0);
-    const int top = lua_gettop(L);
-    int index = 1;
-    for (auto it : new_queries) {
-        xlua_pushlstring(L, it);                    // new queries
-        lua_rawseti(L, top, index);
-        index++;
-    }
-
-    return 3;
+    return 2;
 }
 
-inline std::vector<std::shared_ptr<Item> >
+inline std::vector<Item *>
 itemNullVector(unsigned int count)
 {
-    std::vector<std::shared_ptr<Item> > out;
+    std::vector<Item *> out;
     for (unsigned int i = 0; i < count; ++i) {
-        out.push_back(std::shared_ptr<Item>(make_null()));
+        out.push_back(make_null());
     }
 
     return out;
 }
 
-static void
+static ResType
 getResTypeFromLuaTable(lua_State *const L, int fields_index,
-                       int rows_index, ResType *const out_res)
+                       int rows_index, int affected_rows_index,
+                       int insert_id_index, int status_index)
 {
+    const bool status = lua_toboolean(L, status_index);
+    if (false == status) {
+        return ResType(false, 0, 0);
+    }
+
+    std::vector<std::string> names;
+    std::vector<enum_field_types> types;
     /* iterate over the fields argument */
     lua_pushnil(L);
     while (lua_next(L, fields_index)) {
@@ -354,9 +344,9 @@ getResTypeFromLuaTable(lua_State *const L, int fields_index,
         while (lua_next(L, -2)) {
             const std::string k = xlua_tolstring(L, -2);
             if ("name" == k) {
-                out_res->names.push_back(xlua_tolstring(L, -1));
+                names.push_back(xlua_tolstring(L, -1));
             } else if ("type" == k) {
-                out_res->types.push_back(static_cast<enum_field_types>(luaL_checkint(L, -1)));
+                types.push_back(static_cast<enum_field_types>(luaL_checkint(L, -1)));
             } else {
                 LOG(warn) << "unknown key " << k;
             }
@@ -366,9 +356,10 @@ getResTypeFromLuaTable(lua_State *const L, int fields_index,
         lua_pop(L, 1);
     }
 
-    assert(out_res->names.size() == out_res->types.size());
+    assert(names.size() == types.size());
 
     /* iterate over the rows argument */
+    std::vector<std::vector<Item *> > rows;
     lua_pushnil(L);
     while (lua_next(L, rows_index)) {
         if (!lua_istable(L, -1))
@@ -376,105 +367,141 @@ getResTypeFromLuaTable(lua_State *const L, int fields_index,
 
         /* initialize all items to NULL, since Lua skips
            nil array entries */
-        std::vector<std::shared_ptr<Item> > row =
-            itemNullVector(out_res->types.size());
+        std::vector<Item *> row = itemNullVector(types.size());
 
         lua_pushnil(L);
         while (lua_next(L, -2)) {
             const int key = luaL_checkint(L, -2) - 1;
 
             assert(key >= 0
-                   && static_cast<uint>(key) < out_res->types.size());
+                   && static_cast<uint>(key) < types.size());
             const std::string data = xlua_tolstring(L, -1);
-            Item *const value =
-                make_item_by_type(data, out_res->types[key]);
-            row[key] = std::shared_ptr<Item>(value);
+            row[key] = MySQLFieldTypeToItem(types[key], data);
 
             lua_pop(L, 1);
         }
         // We can not use this assert because rows that contain many
         // NULLs don't return their columns in a strictly increasing
         // order.
-        // assert((unsigned int)key == out_res->names.size() - 1);
+        // assert((unsigned int)key == names.size() - 1);
 
-        out_res->rows.push_back(row);
+        rows.push_back(row);
         lua_pop(L, 1);
     }
+
+    return ResType(status, lua_tointeger(L, affected_rows_index),
+                   lua_tointeger(L, insert_id_index), std::move(names),
+                   std::move(types), std::move(rows));
+}
+
+static void
+nilBuffer(lua_State *const L, size_t count)
+{
+    while (count--) {
+        lua_pushnil(L);
+    }
+
+    return;
 }
 
 static int
-envoi(lua_State *const L)
+next(lua_State *const L)
 {
     ANON_REGION(__func__, &perf_cg);
     scoped_lock l(&big_lock);
     assert(0 == mysql_thread_init());
 
-    THD *const thd = static_cast<THD *>(create_embedded_thd(0));
-    auto thd_cleanup = cleanup([&thd]
-        {
-            thd->clear_data_list();
-            thd->store_globals();
-            thd->unlink();
-            delete thd;
-        });
-
     const std::string client = xlua_tolstring(L, 1);
     if (clients.find(client) == clients.end()) {
-        return 0;
+        xlua_pushlstring(L, "error");
+        xlua_pushlstring(L, "unknown client");
+         lua_pushinteger(L,  100);
+        xlua_pushlstring(L, "12345");
+
+        nilBuffer(L, 1);
+        return 5;
     }
     WrapperState *const c_wrapper = clients[client];
 
     assert(EXECUTE_QUERIES);
-    assert(ps);
 
-    ResType res;
-    getResTypeFromLuaTable(L, 2, 3, &res);
+    ProxyState *const ps = thread_ps = c_wrapper->ps.get();
+    assert(ps);
+    ps->safeCreateEmbeddedTHD();
+
+    const ResType &res = getResTypeFromLuaTable(L, 2, 3, 4, 5, 6);
     const std::unique_ptr<QueryRewrite> &qr = c_wrapper->getQueryRewrite();
     try {
-        const EpilogueResult &epi_result =
-            queryEpilogue(*ps, *qr.get(), res, c_wrapper->last_query,
-                          c_wrapper->default_db, false);
-        if (QueryAction::ROLLBACK == epi_result.action) {
-            lua_pushboolean(L, true);           // success
-            lua_pushboolean(L, true);           // rollback
-            lua_pushnil(L);                     // error message
-            lua_pushnil(L);                     // plaintext fields
-            lua_pushnil(L);                     // plaintext rows
+        NextParams nparams(*ps, c_wrapper->default_db, c_wrapper->last_query);
+
+        c_wrapper->selfKill(KillZone::Where::Before);
+        const auto &new_results = qr->executor->next(res, nparams);
+        c_wrapper->selfKill(KillZone::Where::After);
+
+        const auto &result_type = new_results.first;
+        if (result_type != AbstractQueryExecutor::ResultType::QUERY_COME_AGAIN) {
+            // set the killzone when we are done with this query
+            // > a given killzone will only apply to the next query translation
+            c_wrapper->setKillZone(qr->kill_zone);
+        }
+        switch (result_type) {
+        case AbstractQueryExecutor::ResultType::QUERY_COME_AGAIN: {
+            // more to do before we have the client's results
+            xlua_pushlstring(L, "again");
+
+            const auto &output =
+                std::get<1>(new_results)->extract<std::pair<bool, std::string> >();
+
+            const auto &want_interim = output.first;
+            lua_pushboolean(L, want_interim);
+
+            const auto &next_query = output.second;
+            xlua_pushlstring(L, next_query);
+
+            nilBuffer(L, 2);
             return 5;
         }
+        case AbstractQueryExecutor::ResultType::QUERY_USE_RESULTS: {
+            // the results of executing this query should be send directly
+            // back to the client
+            xlua_pushlstring(L, "query-results");
+            const auto &new_query =
+                std::get<1>(new_results)->extract<std::string>();
 
-        assert(QueryAction::VANILLA == epi_result.action);
-        return returnResultSet(L, epi_result.res_type);
-    } catch (const SynchronizationException &e) {
-        lua_pushboolean(L, false);              // status
-        lua_pushboolean(L, false);              // rollback
-        xlua_pushlstring(L, e.to_string());     // error message
-        lua_pushnil(L);                         // plaintext fields
-        lua_pushnil(L);                         // plaintext rows
-        return 5;
-    } catch (const AbstractException &e) {
-        lua_pushboolean(L, false);              // status
-        lua_pushboolean(L, false);              // rollback
-        xlua_pushlstring(L, e.to_string());     // error message
-        lua_pushnil(L);                         // plaintext fields
-        lua_pushnil(L);                         // plaintext rows
-        return 5;
-    } catch (const CryptDBError &e) {
-        lua_pushboolean(L, false);              // status
-        lua_pushboolean(L, false);              // rollback
-        xlua_pushlstring(L, e.msg);             // error message
-        lua_pushnil(L);                         // plaintext fields
-        lua_pushnil(L);                         // plaintext rows
+            xlua_pushlstring(L, new_query);
+            nilBuffer(L, 3);
+            return 5;
+        }
+        case AbstractQueryExecutor::ResultType::RESULTS: {
+            // ready to return results to the client
+            xlua_pushlstring(L, "results");
+
+            const auto &res = new_results.second->extract<ResType>();
+            returnResultSet(L, res);        // pushes 4 items on stack
+            return 5;
+        }
+        default:
+            assert(false);
+        }
+    } catch (const ErrorPacketException &e) {
+        // lua_pop(L, lua_gettop(L));
+        xlua_pushlstring(L, "error");
+        xlua_pushlstring(L, e.getMessage());
+         lua_pushinteger(L, e.getErrorCode());
+        xlua_pushlstring(L, e.getSQLState());
+
+        nilBuffer(L, 1);
         return 5;
     }
 }
 
-static int
+static void
 returnResultSet(lua_State *const L, const ResType &rd)
 {
-    lua_pushboolean(L, true);                   // status
-    lua_pushboolean(L, false);                  // rollback
-    lua_pushnil(L);                             // error message
+    TEST_GenericPacketException(true == rd.ok, "something bad happened");
+
+    lua_pushinteger(L, rd.affected_rows);
+    lua_pushinteger(L, rd.insert_id);
 
     /* return decrypted result set */
     lua_createtable(L, (int)rd.names.size(), 0);
@@ -517,7 +544,7 @@ returnResultSet(lua_State *const L, const ResType &rd)
         lua_rawseti(L, t_rows, i+1);
     }
 
-    return 5;
+    return;
 }
 
 static const struct luaL_reg
@@ -526,7 +553,7 @@ cryptdb_lib[] = {
     F(connect),
     F(disconnect),
     F(rewrite),
-    F(envoi),
+    F(next),
     { 0, 0 },
 };
 

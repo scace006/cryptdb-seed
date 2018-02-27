@@ -74,17 +74,3 @@ IdentifierNotFound::to_string() const
            + AbstractException::to_string();
 }
 
-std::string
-SynchronizationException::to_string() const
-{
-    return "** Synchronization Failure **\n"
-           + error.to_string();
-}
-
-std::ostream &operator<<(std::ostream &out,
-                         const SynchronizationException &error)
-{
-    out << error.to_string();
-    return out;
-}
-

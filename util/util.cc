@@ -120,8 +120,6 @@ uint64FromZZ(ZZ val)
     return res;
 }
 
-
-
 std::string
 StringFromZZ(const ZZ &x)
 {
@@ -227,20 +225,20 @@ void ZZFromBytesFast(ZZ& x, const unsigned char *p, long n) {
 ZZ
 ZZFromUint64 (uint64_t value)
 {
-    unsigned int unit = 256;
+    const unsigned int unit = 256;
     ZZ power;
     power = 1;
     ZZ res;
     res = 0;
 
     while (value > 0) {
-        res = res + ((long int)value % unit) * power;
+        res = res + (value % unit) * power;
         power = power * unit;
         value = value / unit;
     }
     return res;
 
-};
+}
 
 char *
 getCStr(const std::string & x) {
@@ -469,3 +467,104 @@ equalsIgnoreCase(const std::string &s1, const std::string &s2)
     return toLowerCase(s1) == toLowerCase(s2);
 }
 
+std::string
+leadingZeros(const std::string &input, size_t count)
+{
+    assert(count >= input.length());
+
+    // add leading zeros until the length matches count
+    std::string zeros;
+    while (zeros.length() < (count - input.length())) {
+        zeros.push_back(0);
+    }
+
+    return zeros + input;
+}
+
+std::string
+trailingZeros(const std::string &input, size_t count)
+{
+    assert(count >= input.length());
+
+    // add trailing zeros until the length matches count
+    std::string zeros;
+    while (zeros.length() < (count - input.length())) {
+        zeros.push_back(0);
+    }
+
+    return input + zeros;
+}
+
+void *
+NormalAlloc::operator new(size_t n)
+{
+    void *const p = malloc(n);
+    if (NULL == p) {
+        throw std::bad_alloc();
+    }
+
+    return p;
+}
+
+void
+NormalAlloc::operator delete(void *const p)
+{
+    if (p) {
+        free(p);
+    }
+
+    return;
+}
+
+static bool
+do64Test(uint64_t n)
+{
+    RFIF(n == uint64FromZZ(ZZFromUint64(n)));
+
+    #if __x86_64__
+        static_assert(sizeof(long) == sizeof(uint64_t),
+                      "64 bit platform without 64 bit longs");
+        auto const &nativeZZFromUint64 =
+            [] (uint64_t enn) {return to_ZZ(enn);};
+        auto const &nativeUint64FromZZ =
+            [] (ZZ zee)
+            {
+                uint64_t out;
+                conv(out, zee);
+                return out;
+            };
+        RFIF(n == uint64FromZZ(nativeZZFromUint64(n)));
+        RFIF(n == nativeUint64FromZZ(ZZFromUint64(n)));
+    #endif
+
+    return true;
+}
+
+// quick n dirty unit testing
+bool
+test64bitZZConversions()
+{
+    // there was a problem with numbers larger than 0x7FFFFFFFFFFFFFFF; they
+    // were too small by 256 after conversions
+    const uint64_t low_bad = 0x7FFFFFFFFFFFFFF0;
+    for (uint64_t i = low_bad; i <= low_bad + 50; ++i) {
+        RFIF(do64Test(i));
+    }
+
+    // try some other value
+    const uint64_t other_start = 0x9ABCD00012340000;
+    for (uint64_t i = other_start; i <= other_start + 50; ++i) {
+        RFIF(do64Test(i));
+    }
+
+    // try the biggest values
+    {
+        const uint64_t high_bad = 0xFFFFFFFFFFFFFFC0;
+        uint64_t i = high_bad;
+        do {
+            RFIF(do64Test(i));
+        } while (i++ < 0xFFFFFFFFFFFFFFFF);
+    }
+
+    return true;
+}

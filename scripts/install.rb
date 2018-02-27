@@ -32,12 +32,12 @@ def get_pkgs
 
     pkg_shell = ShellDoer.new("~")
     pkg_shell.>(%q{
-        sudo apt-get install -y gawk liblua5.1-0-dev libntl-dev                 \
-                libmysqlclient-dev libssl-dev libbsd-dev                        \
-                libevent-dev libglib2.0-dev libgmp-dev                          \
-                libaio-dev automake                                             \
-                gtk-doc-tools flex cmake libncurses5-dev                        \
-                g++ make cscope
+        sudo apt-get install -y gawk liblua5.1-0-dev libntl-dev         \
+                libmysqlclient-dev libssl-dev libbsd-dev        \
+                libevent-dev libglib2.0-dev libgmp-dev          \
+                libaio-dev automake                \
+                gtk-doc-tools flex cmake libncurses5-dev        \
+                g++ make
     })
 end
 
@@ -68,7 +68,11 @@ def fn(cdb_path, in_make_v=nil, in_gcc_v=nil)
     # untar
     proxy_path = File.join(cryptdb_path, PROXY_NAME)
     proxy_tar_path = File.join(bins_path, PROXY_NAME) + TAR_GZ
-    cryptdb_shell.>("tar zxf #{proxy_tar_path}") 
+    cryptdb_shell.>("rm -rf #{proxy_path}")
+    cryptdb_shell.>("tar zxf #{proxy_tar_path}")
+
+=begin
+    # only applicable to 0.9 proxy
 
     # automake compatibility fix
     # https://www.flameeyes.eu/autotools-mythbuster/forwardporting/automake.html
@@ -81,13 +85,14 @@ def fn(cdb_path, in_make_v=nil, in_gcc_v=nil)
         little = File.join(proxy_path, "little_configure.in")
         FileUtils.copy(little, config_path)
     end
+=end
 
+    mp_shell = ShellDoer.new(proxy_path)
     proxy_install_path = File.join(bins_path, "proxy-bin")
     mp_shell.>("./autogen.sh")
     mp_shell.>("./configure --enable-maintainer-mode --with-lua=lua5.1 --prefix=\"#{proxy_install_path}\"")
     mp_shell.>("make")
     mp_shell.>("make install")
-    File.delete(config_path)
     mp_shell.>("rm -rf #{proxy_path}")
 
     #############################
@@ -119,6 +124,7 @@ def fn(cdb_path, in_make_v=nil, in_gcc_v=nil)
     # untar
     mysql_path = File.join(cryptdb_path, MYSQL_NAME)
     mysql_tar_path = File.join(bins_path, MYSQL_NAME) + TAR_GZ
+    cryptdb_shell.>("rm -rf #{mysql_path}")
     cryptdb_shell.>("tar zxf #{mysql_tar_path}")
 
     mysql_build_path = File.join(mysql_path, "/build")
@@ -146,8 +152,12 @@ def fn(cdb_path, in_make_v=nil, in_gcc_v=nil)
     shadow_path = File.join(cryptdb_path, SHADOW_NAME)
     cryptdb_shell.>("rm -rf #{shadow_path}")
     cryptdb_shell.>("mkdir #{shadow_path}")
+
     # Give the user access to all the stuff we created.
     cryptdb_shell.>("chown -R root #{cryptdb_path}")
+
+    # remind the user about EDBDIR
+    p_puts "You must do: export EDBDIR=/full/path/to/cryptdb/ before running cryptdb; we recommend putting it into your .bashrc"
 end
 
 class ShellDoer
@@ -221,7 +231,6 @@ end
 def generate_config(mysql_path)
     ["MYSRC := #{mysql_path}",
      "MYBUILD  := $(MYSRC)/build",
-     "RPATH := 1",
      "",
      "## To enable debugging:",
      "# CXXFLAGS += -g",

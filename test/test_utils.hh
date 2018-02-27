@@ -16,6 +16,10 @@
 #include <parser/sql_utils.hh>
 #include <main/rewrite_main.hh>
 
+typedef std::map<const std::string, const std::string> FieldOnionState;
+typedef std::map<const std::string, FieldOnionState> TableOnionState;
+typedef std::map<const std::string, TableOnionState> DBOnionState;
+
 class TestConfig {
  public:
     TestConfig() {
@@ -53,23 +57,37 @@ class TestConfig {
     std::string edbdir;
 };
 
+struct CrashPoint {
+    std::string name;
+    bool executed_query;
+
+    CrashPoint(std::string namearg, bool eq)
+        : name(namearg), executed_query(eq)
+    {}
+};
+
 struct Query {
     std::string query;
-    std::vector<std::string> crash_points;
+    CrashPoint * crash_point;
+    DBOnionState * onion_states;
+    enum class WHERE_EXEC {TEST, CONTROL, BOTH};
+    WHERE_EXEC where_exec;
 
-    Query(const std::string &q) {
-        query = q;
-    }
+    Query(const std::string &q, WHERE_EXEC where_exec=WHERE_EXEC::BOTH)
+        : query(q), crash_point(NULL), onion_states(NULL),
+          where_exec(where_exec) {}
 
-    Query(const std::string &q, const std::string &cp) {
-        query = q;
-        crash_points.push_back(cp);
-    }
+    Query(const std::string &q, CrashPoint *const cp)
+        : query(q), crash_point(cp), onion_states(NULL),
+          where_exec(WHERE_EXEC::BOTH) {}
 
-    Query(const std::string &q, const std::vector<std::string> &cps) {
-        query = q;
-        crash_points = cps;
-    }
+    Query(const std::string &q, DBOnionState *const os)
+        : query(q), crash_point(NULL), onion_states(os),
+          where_exec(WHERE_EXEC::BOTH) {}
+
+    Query(const std::string &q, CrashPoint *const cp, DBOnionState *const os)
+        : query(q), crash_point(cp), onion_states(os),
+          where_exec(WHERE_EXEC::BOTH) {}
 };
 
 #define PLAIN 0
@@ -92,6 +110,7 @@ assert_res(const ResType &r, const char *msg)
 static inline bool
 slowMatch(ResType res, ResType expected)
 {
+    /*
     if (res.names != expected.names
         || res.rows.size() != expected.rows.size()) {
 
@@ -120,8 +139,9 @@ slowMatch(ResType res, ResType expected)
             return false;
         }
     }
+    */
 
-    return true;
+    return false;
 }
 
 static inline bool
@@ -149,6 +169,7 @@ sp(const std::string &s)
 inline bool
 testSlowMatch()
 {
+    /*
     const std::vector<std::shared_ptr<Item> > row0 =
         {sp("box"), sp("rocks"), sp("candy")};
     const std::vector<std::shared_ptr<Item> > row1 =
@@ -157,22 +178,22 @@ testSlowMatch()
         {sp("box"), sp("candy"), sp("rocks")};
     const std::vector<std::string> fields({"red", "green", "black"});
 
-    ResType expected0;
-    ResType res0;
+    ResType expected0(true);
+    ResType res0(true);
     res0.names = expected0.names = fields;
     res0.rows = expected0.rows =
         std::vector<std::vector<std::shared_ptr<Item> > > ({
             row0, row1, row2});
 
-    ResType expected1;
-    ResType res1;
+    ResType expected1(true);
+    ResType res1(true);
     res1.names = expected1.names = fields;
     res1.rows = expected1.rows =
         std::vector<std::vector<std::shared_ptr<Item> > > ({
             row0, row1, row0});
 
-    ResType expected2;
-    ResType res2;
+    ResType expected2(true);
+    ResType res2(true);
     res2.names = expected2.names = fields;
     expected2.rows =
         std::vector<std::vector<std::shared_ptr<Item> > > ({
@@ -181,8 +202,8 @@ testSlowMatch()
         std::vector<std::vector<std::shared_ptr<Item> > > ({
             row0, row1, row1});
 
-    ResType expected3;
-    ResType res3;
+    ResType expected3(true);
+    ResType res3(true);
     res3.names = expected3.names = fields;
     expected3.rows =
         std::vector<std::vector<std::shared_ptr<Item> > > ({
@@ -191,8 +212,8 @@ testSlowMatch()
         std::vector<std::vector<std::shared_ptr<Item> > > ({
             row2, row1, row0});
 
-    ResType expected4;
-    ResType res4;
+    ResType expected4(true);
+    ResType res4(true);
     res4.names = expected4.names = fields;
     expected4.rows =
         std::vector<std::vector<std::shared_ptr<Item> > > ({
@@ -211,4 +232,7 @@ testSlowMatch()
            true == slowMatch(expected3, res3) &&
            false == slowMatch(res4, expected4) &&
            false == slowMatch(expected4, res4);
+    */
+
+    return false;
 }

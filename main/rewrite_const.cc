@@ -25,7 +25,6 @@
 #define ANON                ANON_NAME(__anon_id_const)
 
 // encrypts a constant item based on the information in a
-// FIXME: @i should be const ref.
 static Item *
 encrypt_item(const Item &i, const OLK &olk, Analysis &a)
 {
@@ -39,7 +38,7 @@ encrypt_item(const Item &i, const OLK &olk, Analysis &a)
     assert(fm);
 
     const onion o = olk.o;
-    LOG(cdb_v) << fm->fname << " " << fm->children.size();
+    LOG(cdb_v) << fm->getFieldName() << " " << fm->getChildren().size();
 
     const auto it = a.salts.find(fm);
     const salt_type IV = (it == a.salts.end()) ? 0 : it->second;
@@ -79,6 +78,34 @@ static class ANON : public CItemSubtypeIT<Item_string,
         typical_rewrite_insert_type(i, fm, a, l);
     }
 } ANON;
+
+static class ANON : public CItemSubtypeIT<Item_float,
+                                          Item::Type::REAL_ITEM> {
+    virtual RewritePlan *
+    do_gather_type(const Item_float &i, Analysis &a) const
+    {
+        LOG(cdb_v) << " Float item do_gather " << i << std::endl;
+        const std::string why = "is a float constant";
+        reason rsn(PLAIN_EncSet, why, i);
+        return new RewritePlan(PLAIN_EncSet, rsn);
+    }
+
+    virtual Item *
+    do_rewrite_type(const Item_float &i, const OLK &constr,
+                    const RewritePlan &rp, Analysis &a) const
+    {
+        LOG(cdb_v) << "do_rewrite_type Float item " << i << std::endl;
+        return encrypt_item(i, constr, a);
+    }
+
+    virtual void
+    do_rewrite_insert_type(const Item_float &i, const FieldMeta &fm,
+                           Analysis &a, std::vector<Item *> *l) const
+    {
+        typical_rewrite_insert_type(i, fm, a, l);
+    }
+} ANON;
+
 
 static class ANON : public CItemSubtypeIT<Item_int, Item::Type::INT_ITEM> {
     virtual RewritePlan *

@@ -5,6 +5,8 @@
 
 #include <main/Connect.hh>
 
+#define STORED_QUERY_LENGTH 10000
+
 namespace MetaData {
     bool initialize(const std::unique_ptr<Connect> &conn,
                     const std::unique_ptr<Connect> &e_conn,
@@ -15,13 +17,12 @@ namespace MetaData {
         std::string bleedingMetaObject();
         std::string embeddedQueryCompletion();
         std::string staleness();
+        std::string showDirective();
         std::string remoteQueryCompletion();
     };
 
     namespace Proc {
-        std::string currentTransactionID();
-        std::string homAdditionTransaction();
-        std::string adjustOnion();
+        std::string activeTransactionP();
     };
 
     namespace DB {

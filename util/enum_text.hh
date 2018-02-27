@@ -5,6 +5,8 @@
 #include <iostream>
 #include <algorithm>
 
+#include <util/util.hh>
+
 template <typename _type>
 class TypeText {
 public:
@@ -25,10 +27,25 @@ public:
         return theTexts[it - theEnums.begin()];
     }
 
+    // FIXME: abstract with matching op
     _type getEnum(std::string t) {
         auto it = std::find(theTexts.begin(), theTexts.end(), t);
         if (theTexts.end() == it) {
             throw "text does not exist!";
+        }
+
+        return theEnums[it - theTexts.begin()];
+    }
+
+    // FIXME: ^^^
+    _type noCaseGetEnum(std::string t) {
+        auto it =
+            std::find_if(theTexts.begin(), theTexts.end(),
+                         [&t] (std::string match_p) {
+                            return equalsIgnoreCase(t, match_p);
+                         });
+        if (theTexts.end() == it) {
+            throw CryptDBError("text does not exist!");
         }
 
         return theEnums[it - theTexts.begin()];
@@ -60,6 +77,10 @@ public:
 
     static _type toType(std::string t) {
         return TypeText<_type>::instance->getEnum(t);
+    }
+
+    static _type noCaseToType(std::string t) {
+        return TypeText<_type>::instance->noCaseGetEnum(t);
     }
 
     static std::string parenList() {

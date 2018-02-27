@@ -12,6 +12,7 @@
 #include <crypto/SWPSearch.hh>
 
 #include <main/dbobject.hh>
+#include <main/macro_util.hh>
 
 #include <sql_select.h>
 #include <sql_delete.h>
@@ -51,19 +52,18 @@ public:
     EncLayer() : LeafDBMeta() {}
     EncLayer(unsigned int id) : LeafDBMeta(id) {}
 
-    std::string typeName() const {return type_name;}
-    static std::string instanceTypeName() {return type_name;}
+    TYPENAME("encLayer")
 
     virtual SECLEVEL level() const = 0;
     virtual std::string name() const = 0;
 
     // returns a rewritten create field to include in rewritten query
     virtual Create_field *
-        newCreateField(const Create_field * const cf,
+        newCreateField(const Create_field &cf,
                        const std::string &anonname = "") const = 0;
 
     virtual Item *encrypt(const Item &ptext, uint64_t IV) const = 0;
-    virtual Item *decrypt(Item * const ctext, uint64_t IV) const = 0;
+    virtual Item *decrypt(const Item &ctext, uint64_t IV) const = 0;
 
     // returns the decryptUDF to remove the onion layer
     virtual Item *decryptUDF(Item * const col, Item * const ivcol = NULL)
@@ -81,28 +81,26 @@ public:
 
 protected:
      friend class EncLayerFactory;
-
-private:
-     constexpr static const char * type_name = "encLayer";
 };
 
 class HOM : public EncLayer {
 public:
-    HOM(Create_field * const cf, const std::string &seed_key);
+    HOM(const Create_field &cf, const std::string &seed_key);
 
     // serialize and deserialize
     std::string doSerialize() const {return seed_key;}
     HOM(unsigned int id, const std::string &serial);
+    ~HOM();
 
     SECLEVEL level() const {return SECLEVEL::HOM;}
     std::string name() const {return "HOM";}
-    Create_field * newCreateField(const Create_field * const cf,
+    Create_field * newCreateField(const Create_field &cf,
                                   const std::string &anonname = "")
         const;
 
     //TODO needs multi encrypt and decrypt
     Item *encrypt(const Item &p, uint64_t IV) const;
-    Item * decrypt(Item * const c, uint64_t IV) const;
+    Item * decrypt(const Item &c, uint64_t IV) const;
 
     //expr is the expression (e.g. a field) over which to sum
     Item *sumUDA(Item *const expr) const;
@@ -113,8 +111,6 @@ protected:
     static const uint nbits = 1024;
     mutable Paillier_priv * sk;
 
-    ~HOM();
-
 private:
     void unwait() const;
 
@@ -123,7 +119,7 @@ private:
 
 class Search : public EncLayer {
 public:
-    Search(Create_field * const cf, const std::string &seed_key);
+    Search(const Create_field &cf, const std::string &seed_key);
 
     // serialize and deserialize
     std::string doSerialize() const {return key;}
@@ -131,12 +127,12 @@ public:
 
     SECLEVEL level() const {return SECLEVEL::SEARCH;}
     std::string name() const {return "SEARCH";}
-    Create_field * newCreateField(const Create_field * const cf,
+    Create_field * newCreateField(const Create_field &cf,
                                   const std::string &anonname = "")
         const;
 
     Item *encrypt(const Item &ptext, uint64_t IV) const;
-    Item * decrypt(Item * const ctext, uint64_t IV) const
+    Item * decrypt(const Item &ctext, uint64_t IV) const
         __attribute__((noreturn));
 
     //expr is the expression (e.g. a field) over which to sum
@@ -151,13 +147,13 @@ extern const std::vector<udf_func*> udf_list;
 
 class EncLayerFactory {
 public:
-    static EncLayer * encLayer(onion o, SECLEVEL sl,
-                               Create_field * const cf,
-                               const std::string &key);
+    static std::unique_ptr<EncLayer>
+        encLayer(onion o, SECLEVEL sl, const Create_field &cf,
+                 const std::string &key);
 
     // creates EncLayer from its serialization
-    static EncLayer * deserializeLayer(unsigned int id,
-                                       const std::string &serial);
+    static std::unique_ptr<EncLayer>
+        deserializeLayer(unsigned int id, const std::string &serial);
 
     // static std::string serializeLayer(EncLayer * el, DBMeta *parent);
 };
@@ -171,11 +167,11 @@ public:
     virtual SECLEVEL level() const {return SECLEVEL::PLAINVAL;}
     virtual std::string name() const {return "PLAINTEXT";}
 
-    virtual Create_field *newCreateField(const Create_field * const cf,
+    virtual Create_field *newCreateField(const Create_field &cf,
                                          const std::string &anonname = "")
         const;
     Item *encrypt(const Item &ptext, uint64_t IV) const;
-    Item *decrypt(Item * const ctext, uint64_t IV) const;
+    Item *decrypt(const Item &ctext, uint64_t IV) const;
     Item *decryptUDF(Item * const col, Item * const ivcol = NULL)
         const __attribute__((noreturn));
     std::string doSerialize() const;

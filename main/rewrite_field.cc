@@ -112,19 +112,26 @@ class ANON : public CItemSubtypeIT<Item_field, Item::Type::FIELD_ITEM> {
             throw OnionAdjustExcept(tm, fm, constr.o, constr.l);
         }
 
+        bool is_alias;
         const std::string anon_table_name =
-            a.getAnonTableName(db_name, plain_table_name);
+            a.getAnonTableName(db_name, plain_table_name, &is_alias);
         const std::string anon_field_name = om.getAnonOnionName();
 
         Item_field * const res =
             make_item_field(i, anon_table_name, anon_field_name);
+
+        // HACK: to get aliases to work in DELETE FROM statements
+        if (a.inject_alias && is_alias) {
+            res->db_name = NULL;
+        }
+
         // This information is only relevant if it comes from a
         // HAVING clause.
         // FIXME: Enforce this semantically.
         a.item_cache[&i] = std::make_pair(res, constr);
 
         // This rewrite may be inside of an ON DUPLICATE KEY UPDATE...
-        // where there query is using the VALUES(...) function.
+        // where the query is using the VALUES(...) function.
         if (isItem_insert_value(i)) {
             const Item_insert_value &insert_i =
                 static_cast<const Item_insert_value &>(i);
@@ -133,24 +140,6 @@ class ANON : public CItemSubtypeIT<Item_field, Item::Type::FIELD_ITEM> {
 
         return res;
     }
-/*
-    static OLK
-    chooseProj(FieldMeta * fm)
-    {
-        SECLEVEL l;
-        if (contains_get(fm->encdesc.olm, oDET, l)) {
-            return OLK(oDET, l, fm);
-        }
-        if (contains_get(fm->encdesc.olm, oOPE, l)) {
-            return OLK(oOPE, l, fm);
-        }
-        if (contains_get(fm->encdesc.olm, oAGG, l)) {
-            return OLK(oAGG, l, fm);
-        }
-        assert_s(false, "field " + fm->fname + " does not have any decryptable onions for projection");
-        return OLK();
-    }
-*/
 
     virtual void
     do_rewrite_insert_type(const Item_field &i, const FieldMeta &fm,

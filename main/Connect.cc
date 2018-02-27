@@ -12,16 +12,25 @@
 #include <sstream>
 #include <memory>
 
+#include <util/cryptdb_log.hh>
 #include <main/Connect.hh>
 #include <main/macro_util.hh>
-#include <util/cryptdb_log.hh>
-#include <main/schema.hh>
+#include <main/Analysis.hh>
+#include <parser/mysql_type_metadata.hh>
+
+__thread ProxyState *thread_ps = NULL;
 
 Connect::Connect(const std::string &server, const std::string &user,
                  const std::string &passwd, uint port)
     : conn(nullptr), close_on_destroy(true)
 {
     do_connect(server, user, passwd, port);
+}
+
+bool
+strictMode(Connect *const c)
+{
+    return c->execute("SET SESSION sql_mode = 'ANSI,TRADITIONAL'");
 }
 
 void
@@ -48,6 +57,12 @@ Connect::do_connect(const std::string &server, const std::string &user,
     /* Connect to real server even if linked against embedded libmysqld */
     mysql_options(conn, MYSQL_OPT_USE_REMOTE_CONNECTION, 0);
 
+    {
+        my_bool reconnect = 1;
+        /* automatically reconnect */
+        mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
+    }
+
     /* Connect to database */
     if (!mysql_real_connect(conn, server.c_str(), user.c_str(),
                             passwd.c_str(), 0, port, 0,
@@ -73,18 +88,15 @@ Connect *Connect::getEmbedded(const std::string &embed_db)
     if (!mysql_real_connect(m, 0, 0, 0, 0, 0, 0,
                             CLIENT_MULTI_STATEMENTS)) {
         mysql_close(m);
-        cryptdb_err() << "mysql_real_connect: " << mysql_error(m);
+        thrower() << "mysql_real_connect: " << mysql_error(m);
     }
 
-    Connect *const conn = new Connect(m);
-    conn->close_on_destroy = true;
-
-    return conn;
+    return new Connect(m);
 }
 
 // @multiple_resultsets causes us to ignore query results.
-// > This is a hack that allows us to deal with the two sets which
-// are returned when CALLing a stored procedure.
+// > This is a hack that allows us to deal with potentially multiple
+//   sets returned when CALLing a stored procedure.
 bool
 Connect::execute(const std::string &query, std::unique_ptr<DBResult> *res,
                  bool multiple_resultsets)
@@ -103,39 +115,55 @@ Connect::execute(const std::string &query, std::unique_ptr<DBResult> *res,
         success = false;
     } else {
         if (false == multiple_resultsets) {
-            *res =
-                std::unique_ptr<DBResult>(DBResult::wrap(mysql_store_result(conn)));
+            *res = std::unique_ptr<DBResult>(DBResult::store(conn));
         } else {
-            int status;
-            do {
+            // iterate through each result set; if a query leading to
+            // one of the resultsets failed, it will be the last resultset,
+            // so get the error value
+            const bool errno_success = 0 == mysql_errno(conn);
+            while (true) {
                 DBResult_native *const res_native =
                     mysql_store_result(conn);
-                if (res_native) {
-                    mysql_free_result(res_native);
-                } else {
-                    assert(mysql_field_count(conn) == 0);
+
+                const int status = mysql_next_result(conn);
+                if (0 == status) {                  // another result
+                    if (res_native) {
+                        mysql_free_result(res_native);
+                    }
+                } else if (-1 == status) {          // last result
+                    *res = std::unique_ptr<DBResult>(
+                        new DBResult(res_native, errno_success,
+                                     mysql_affected_rows(conn),
+                                     mysql_insert_id(conn)));
+                    break;
+                } else {                            // error
+                    thrower() << "error occurred processing multiple"
+                                 " query results";
                 }
-                status = mysql_next_result(conn);
-                assert(status <= 0);
-            } while (0 == status);
+            }
 
             *res = nullptr;
         }
     }
 
-    void *const ret = create_embedded_thd(0);
-    if (!ret) assert(false);
+    if (thread_ps) {
+        thread_ps->safeCreateEmbeddedTHD();
+    } else {
+        assert(create_embedded_thd(0));
+    }
 
     return success;
 }
 
 
+// because the caller is ignoring the ResType we must account for
+// errors encoded in the ResType
 bool
 Connect::execute(const std::string &query, bool multiple_resultsets)
 {
     std::unique_ptr<DBResult> aux;
     const bool r = execute(query, &aux, multiple_resultsets);
-    return r;
+    return r && aux->getSuccess();
 }
 
 std::string
@@ -170,15 +198,13 @@ Connect::~Connect()
     }
 }
 
-DBResult::DBResult()
-{}
-
 DBResult *
-DBResult::wrap(DBResult_native *const n)
+DBResult::store(MYSQL *const mysql)
 {
-    DBResult *const r = new DBResult();
-    r->n = n;
-    return r;
+    const bool success = 0 == mysql_errno(mysql);
+    DBResult_native *const n = mysql_store_result(mysql);
+    return new DBResult(n, success, mysql_affected_rows(mysql),
+                        mysql_insert_id(mysql));
 }
 
 DBResult::~DBResult()
@@ -193,7 +219,7 @@ getItem(char *const content, enum_field_types type, uint len)
         return new Item_null();
     }
     const std::string content_str = std::string(content, len);
-    if (IsMySQLTypeNumeric(type)) {
+    if (isMySQLTypeNumeric(type)) {
         const ulonglong val = valFromStr(content_str);
         return new Item_int(val);
     } else {
@@ -212,45 +238,47 @@ getItem(char *const content, enum_field_types type, uint len)
 ResType
 DBResult::unpack()
 {
+    // 'n' will be NULL when the mysql statement doesn't return a resultset
+    // > ie INSERT
     if (nullptr == n) {
-        return ResType();
+        return ResType(this->success, this->affected_rows, this->insert_id);
     }
 
-    const size_t rows = static_cast<size_t>(mysql_num_rows(n));
-    if (0 == rows) {
-        return ResType();
-    }
+    const size_t row_count = static_cast<size_t>(mysql_num_rows(n));
+    const int col_count    = mysql_num_fields(n);
 
-    const int cols = mysql_num_fields(n);
-
-    ResType res;
-
+    std::vector<std::string> names;
+    std::vector<enum_field_types> types;
     for (int j = 0;; j++) {
         MYSQL_FIELD *const field = mysql_fetch_field(n);
         if (!field) {
+            assert(col_count == j);
             break;
         }
 
-        res.names.push_back(field->name);
-        res.types.push_back(field->type);
+        names.push_back(field->name);
+        types.push_back(field->type);
     }
 
-    for (int index = 0;; index++) {
-        MYSQL_ROW row = mysql_fetch_row(n);
+    std::vector<std::vector<Item *> > rows;
+    for (size_t index = 0;; index++) {
+        const MYSQL_ROW row = mysql_fetch_row(n);
         if (!row) {
+            assert(row_count == index);
             break;
         }
         unsigned long *const lengths = mysql_fetch_lengths(n);
 
-        std::vector<std::shared_ptr<Item> > resrow;
+        std::vector<Item *> resrow;
 
-        for (int j = 0; j < cols; j++) {
-            Item *const item = getItem(row[j], res.types[j], lengths[j]);
-            resrow.push_back(std::shared_ptr<Item>(item));
+        for (int j = 0; j < col_count; j++) {
+            Item *const item = getItem(row[j], types[j], lengths[j]);
+            resrow.push_back(item);
         }
 
-        res.rows.push_back(resrow);
+        rows.push_back(resrow);
     }
 
-    return res;
+    return ResType(this->success, this->affected_rows, this->insert_id,
+                   std::move(names), std::move(types), std::move(rows));
 }

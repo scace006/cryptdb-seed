@@ -7,7 +7,7 @@
 #include <main/serializers.hh>
 
 // FIXME: Maybe should inherit from DBObject.
-class AbstractMetaKey {
+class AbstractMetaKey : public NormalAlloc {
 public:
     AbstractMetaKey() {;}
     virtual ~AbstractMetaKey() {;}
@@ -137,11 +137,12 @@ class Connect;
  *  read SchemaInfo from database.
  *  > Logic is in SQL.
  */
-class DBMeta : public DBObject {
+class DBMeta : public DBObject, public NormalAlloc {
 public:
     DBMeta() {}
     explicit DBMeta(unsigned int id) : DBObject(id) {}
     virtual ~DBMeta() {;}
+
     // FIXME: Use rtti.
     virtual std::string typeName() const = 0;
     virtual std::vector<DBMeta *>
@@ -197,19 +198,20 @@ public:
     MappedDBMeta() {}
     MappedDBMeta(unsigned int id) : DBMeta(id) {}
     virtual ~MappedDBMeta() {}
-    virtual bool addChild(KeyType key,
-                          std::unique_ptr<ChildType> meta);
+    virtual bool addChild(KeyType key, std::unique_ptr<ChildType> meta);
     virtual bool childExists(const KeyType &key) const;
-    virtual ChildType *
-        getChild(const KeyType &key) const;
+    virtual ChildType * getChild(const KeyType &key) const;
     KeyType const &getKey(const DBMeta &child) const;
     virtual std::vector<DBMeta *>
         fetchChildren(const std::unique_ptr<Connect> &e_conn);
-    bool applyToChildren(std::function<bool(const DBMeta &)>
-        fn) const;
+    bool applyToChildren(std::function<bool(const DBMeta &)> fn) const;
+    const std::map<KeyType, std::unique_ptr<ChildType> > &
+        getChildren() const {return children;}
+    virtual const ChildType *
+        getChildWithGChild(const DBMeta &gchild) const;
 
-    // FIXME: Make protected.
-    std::map<KeyType, std::unique_ptr<ChildType>> children;
+private:
+    std::map<KeyType, std::unique_ptr<ChildType> > children;
 };
 
 #include <main/dbobject.tt>

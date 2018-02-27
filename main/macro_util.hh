@@ -3,14 +3,16 @@
 #include <main/rewrite_ds.hh>
 #include <main/error.hh>
 
-#define RETURN_FALSE_IF_FALSE(status)       \
-{                                           \
-    if (!(status)) {                        \
-        return false;                       \
-    }                                       \
-}
+#define TYPENAME(value)                                         \
+    std::string typeName() const {return (value);}              \
+    static std::string instanceTypeName() {return (value);}
 
-#define RFIF RETURN_FALSE_IF_FALSE
+
+#define RETURN_NULL_IF_NULL(p)              \
+    (p);                                    \
+    if (!(p)) {                             \
+        return NULL;                        \
+    }
 
 #define ROLLBACK_AND_RFIF(status, conn)                 \
 {                                                       \
@@ -19,15 +21,6 @@
         return false;                                   \
     }                                                   \
 }                                                       \
-
-// FIXME: 'assert' is incorrect handling.
-#define SYNC_IF_FALSE(status, conn)                     \
-{                                                       \
-    if (!(status)) {                                    \
-        assert((conn)->execute("ROLLBACK;"));           \
-        TEST_Sync(status, "query failed");              \
-    }                                                   \
-}
 
 inline void
 testBadItemArgumentCount(const std::string &file_name,
@@ -100,6 +93,8 @@ testTextMessageError(const std::string &file_name,
     testTextMessageError(__FILE__, __LINE__, (test), (message));    \
 }                                                                   \
 
+#define TEST_Text TEST_TextMessageError
+
 #define FAIL_TextMessageError(message)                              \
 {                                                                   \
     throw TextMessageError(__FILE__, __LINE__, (message));          \
@@ -147,24 +142,28 @@ testDatabaseNotFound(const std::string &file_name,
     testDatabaseNotFound(__FILE__, __LINE__, (test),                \
                           (identifier_name));                       \
 }
-inline void
-testSync(const std::string &file_name, unsigned int line_number,
-         bool test, const std::string &identifier_name)
-{
-    if (false == test) {
-        throw SynchronizationException(file_name, line_number,
-                                       identifier_name);
-    }
+
+#define SYNC_IF_FALSE(status, conn)                     \
+{                                                       \
+    const auto &s = (status);                            \
+    if (!s) {                                           \
+        assert((conn)->execute("ROLLBACK;"));           \
+        TEST_ErrPkt(s, "query failed");                 \
+    }                                                   \
 }
 
-
-#define TEST_Sync(test, identifier_name)                            \
-{                                                                   \
-    testSync(__FILE__, __LINE__, (test), (identifier_name));        \
+#define CR_ROLLBACK_AND_FAIL(res, msg)                                  \
+{                                                                       \
+    if (false == res.success()) {                                       \
+        yield return CR_QUERY_AGAIN("ROLLBACK");                        \
+                                                                        \
+        assert(res.success());                                          \
+        FAIL_GenericPacketException((msg));                             \
+    }                                                                   \
 }
 
-#define FAIL_Sync(identifier_name)                                  \
-{                                                                   \
-    testSync(__FILE__, __LINE__, false, (identifier_name));         \
+#define ROLLBACK_ERROR_PACKET                                               \
+{                                                                           \
+    throw ErrorPacketException(__FILE__, __LINE__, "proxy did rollback",    \
+                               1213, "40001");                              \
 }
-

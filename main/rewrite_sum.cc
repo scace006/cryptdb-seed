@@ -44,6 +44,10 @@ rewrite_agg_args(const Item_sum &oldi, const OLK &constr,
     std::list<Item *> res = std::list<Item *>();
     for (int j = 0; j < no_args; j++) {
         const Item *const child_item = RiboldMYSQL::get_arg(oldi, j);
+        // FIXME: this test is correct; but the higher level code must be made
+        // to act properly first
+        // TEST_Text(rp.olk.o == constr.o && rp.olk.l == constr.l,
+                  // "summation arguments do not match constraint");
         Item *const out_child_item =
             itemTypes.do_rewrite(*child_item, rp.olk,
                                  *rp.childr_rp[j].get(), a);
@@ -54,6 +58,8 @@ rewrite_agg_args(const Item_sum &oldi, const OLK &constr,
 }
 
 
+// FIXME: this must be reworked such that constr and the child RewritePlan
+// align properly in do_rewrite_type(...)
 template<Item_sum::Sumfunctype SFT>
 class CItemCount : public CItemSubtypeST<Item_sum_count, SFT> {
     virtual RewritePlan *
@@ -119,11 +125,9 @@ class CItemChooseOrder : public CItemSubtypeST<Item_sum_hybrid, SFT> {
         TEST_NoAvailableEncSet(supported, i.type(), needed, why,
                                childr_rp);
         const OLK olk = supported.chooseOne();
-        const EncSet out = EncSet(olk);
-        const reason rsn(out, why, i);
+        const reason rsn(supported, why, i);
 
-        // INVESTIGATE: Should 'out' be 'supported'?
-        return new RewritePlanOneOLK(out, olk, childr_rp, rsn);
+        return new RewritePlanOneOLK(supported, olk, childr_rp, rsn);
     }
 
     virtual Item *
@@ -160,29 +164,34 @@ class CItemSum : public CItemSubtypeST<Item_sum_sum, SFT> {
             UNIMPLEMENTED;
         }
 
-        const EncSet my_es = ADD_EncSet;
-        const EncSet solution = my_es.intersect(childr_rp[0]->es_out);
-        const std::string why = "summation";
+        const EncSet &my_es = ADD_EncSet;
+        const EncSet &solution = my_es.intersect(childr_rp[0]->es_out);
+        const std::string &why = "summation";
         TEST_NoAvailableEncSet(solution, i.type(), my_es, why,
                                childr_rp);
 
-        const OLK olk = solution.chooseOne();
-        const EncSet return_es = EncSet(olk);
-        const reason rsn(return_es, why, i);
-
-        return new RewritePlanOneOLK(return_es, olk, childr_rp, rsn);
+        reason rsn(solution, why, i);
+        return new RewritePlanWithChildren(solution, rsn, childr_rp);
     }
 
     virtual Item *
     do_rewrite_type(const Item_sum_sum &i, const OLK &constr,
                     const RewritePlan &rp, Analysis &a) const
     {
+        auto rp_wc = static_cast<const RewritePlanWithChildren &>(rp);
+        assert(rp_wc.childr_rp.size() == 1);
+
         LOG(cdb_v) << "Item_sum_sum rewrite " << i << std::endl;
 
-        std::list<Item *> args =
-            rewrite_agg_args(i, constr,
-                             static_cast<const RewritePlanOneOLK &>(rp),
-                             a, 1);
+        TEST_Text(rp.es_out.contains(constr),
+          "summation cannot support it's argument");
+
+        a.summation_hack = true;
+        Item *const new_child =
+            itemTypes.do_rewrite(*RiboldMYSQL::get_arg(i, 0), constr,
+                                 *rp_wc.childr_rp[0].get(), a);
+        a.summation_hack = false;
+        assert(new_child);
 
         if (oAGG == constr.o) {
             OnionMeta *const om = constr.key->getOnionMeta(oAGG);
@@ -190,14 +199,15 @@ class CItemSum : public CItemSubtypeST<Item_sum_sum, SFT> {
             EncLayer const &el = a.getBackEncLayer(*om);
             TEST_UnexpectedSecurityLevel(oAGG, SECLEVEL::HOM,
                                          el.level());
-            return static_cast<const HOM &>(el).sumUDA(args.front());
+            return static_cast<const HOM &>(el).sumUDA(new_child);
         } else {
             TEST_UnexpectedSecurityLevel(constr.o, SECLEVEL::PLAINVAL,
                                          constr.l);
 
-            Item *const new_arg =
-                RiboldMYSQL::clone_item(*RiboldMYSQL::get_arg(i, 0));
-            return new Item_sum_sum(new_arg, i.has_with_distinct());
+            // FIXME: we cannot blindly return Item_sum_sum because we may
+            // have an AVG(...)
+            // > account for ``Item_sum_avg''
+            return new Item_sum_sum(new_child, i.has_with_distinct());
         }
     }
 };
@@ -262,10 +272,12 @@ static class ANON : public CItemSubtypeIT<Item_ref, Item::Type::REF_ITEM> {
                     const RewritePlan &rp, Analysis &a) const
     {
         const std::string &db_name = a.getDatabaseName();
-        // HACK.
+        // SUPPORT
+        TEST_Text(Item::Type::FIELD_ITEM == (*i.ref)->type(),
+                  "Item_ref is not a field; no support");
         const std::string plain_table =
             static_cast<Item_field *>(*i.ref)->table_name;
-        const std::string anon_table =
+        const std::string &anon_table =
             a.getAnonTableName(db_name, plain_table);
 
         const std::string plain_field = i.field_name;
@@ -298,7 +310,7 @@ static class ANON : public CItemSubtypeIT<Item_null, Item::Type::NULL_ITEM> {
     do_rewrite_insert_type(const Item_null &i, const FieldMeta &fm,
                            Analysis &a, std::vector<Item *> *l) const
     {
-        for (uint j = 0; j < fm.children.size(); ++j) {
+        for (uint j = 0; j < fm.getChildren().size(); ++j) {
             l->push_back(RiboldMYSQL::clone_item(i));
         }
         if (fm.getHasSalt()) {

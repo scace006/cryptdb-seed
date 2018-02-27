@@ -38,7 +38,7 @@ dup_item(const Item_func &i)
             return new (current_thd->mem_root)
                 Item_func_neg(i.arguments()[0]);
         default:
-            cryptdb_err() << "Can't clone function type: " << i.type();
+            thrower() << "Can't clone function type: " << i.type();
     }
 }
 
@@ -58,6 +58,12 @@ dup_item(const Item_float &i)
                                                 i.decimals, i.max_length);
 }
 
+Item_field *
+dup_item(const Item_field &i)
+{
+    return new Item_field(current_thd, &const_cast<Item_field &>(i));
+}
+
 Item *
 dup_item(const Item &i)
 {
@@ -75,6 +81,8 @@ dup_item(const Item &i)
         case Item::Type::REAL_ITEM:
             assert(i.field_type() == MYSQL_TYPE_DOUBLE);
             return dup_item(static_cast<const Item_float &>(i));
+        case Item::Type::FIELD_ITEM:
+            return dup_item(static_cast<const Item_field &>(i));
         default:
             throw CryptDBError("Unable to clone: " +
                                std::to_string(i.type()));
@@ -135,6 +143,8 @@ make_item_ref(const Item_ref &i, Item *const new_ref,
     return i0;
 }
 
+// a special type of Item used in ON DUPLICATE KEY UPDATE queries
+// where the item is inside of a VALUES(...) function
 Item_insert_value *
 make_item_insert_value(const Item_insert_value &i,
                        Item_field *const field)
@@ -214,9 +224,15 @@ bool RiboldMYSQL::is_null(const Item &i)
     return const_cast<Item &>(i).is_null();
 }
 
-Item *RiboldMYSQL::clone_item(const Item &i)
+// this will only work for constants
+Item *
+RiboldMYSQL::clone_item(const Item &i)
 {
-    return const_cast<Item &>(i).clone_item();
+    Item *const out_i = const_cast<Item &>(i).clone_item();
+    if (NULL == out_i) {
+        thrower() << "attempted to clone a non constant Item";
+    }
+    return out_i;
 }
 
 const List<Item> *RiboldMYSQL::argument_list(const Item_cond &i)

@@ -18,17 +18,26 @@ typedef MYSQL_RES DBResult_native;
 extern "C" void *create_embedded_thd(int client_flag);
 
 class DBResult {
- private:
-    DBResult();
-
  public:
+    DBResult(DBResult_native *const n, bool success,
+             uint64_t affected_rows, uint64_t insert_id)
+        : n(n), success(success), affected_rows(affected_rows),
+          insert_id(insert_id) {}
+
     ~DBResult();
-    DBResult_native *n;
+    DBResult_native *const n;
 
     //returns data from this db result
     ResType unpack();
 
-    static DBResult *wrap(DBResult_native *);
+    static DBResult *store(MYSQL *const mysql);
+
+    bool getSuccess() const {return success;}
+
+ private:
+    const bool success;
+    const uint64_t affected_rows;
+    const uint64_t insert_id;
 };
 
 class Connect {
@@ -36,7 +45,7 @@ class Connect {
     Connect(const std::string &server, const std::string &user,
             const std::string &passwd, uint port = 0);
 
-    Connect(MYSQL *const _conn) : conn(_conn), close_on_destroy(false) { }
+    Connect(MYSQL *const _conn) : conn(_conn), close_on_destroy(true) { }
 
     //returns Connect for the embedded server
     static Connect *getEmbedded(const std::string &embed_dir);
@@ -65,3 +74,6 @@ class Connect {
 
     bool close_on_destroy;
 };
+
+bool strictMode(Connect *const c);
+

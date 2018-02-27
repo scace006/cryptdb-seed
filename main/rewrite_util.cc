@@ -4,6 +4,7 @@
 #include <main/rewrite_main.hh>
 #include <main/macro_util.hh>
 #include <main/metadata_tables.hh>
+#include <main/schema.hh>
 #include <parser/lex_util.hh>
 #include <parser/stringify.hh>
 #include <util/enum_text.hh>
@@ -168,20 +169,36 @@ gatherAndAddAnalysisRewritePlan(const Item &i, Analysis &a)
     a.rewritePlans[&i] = std::unique_ptr<RewritePlan>(gather(i, a));
 }
 
-LEX *
-begin_transaction_lex(const std::string &dbname)
+std::vector<std::tuple<std::vector<std::string>, Key::Keytype> >
+collectKeyData(const LEX &lex)
 {
-    static const std::string query = "START TRANSACTION;";
-    query_parse *const begin_parse = new query_parse(dbname, query);
-    return begin_parse->lex();
-}
+    std::vector<std::tuple<std::vector<std::string>, Key::Keytype> > output;
 
-LEX *
-commit_transaction_lex(const std::string &dbname)
-{
-    static const std::string query = "COMMIT;";
-    query_parse *const commit_parse = new query_parse(dbname, query);
-    return commit_parse->lex();
+    auto key_it =
+        RiboldMYSQL::constList_iterator<Key>(lex.alter_info.key_list);
+    for (;;) {
+        const Key *const key = key_it++;
+        if (nullptr == key) {
+            break;
+        }
+
+        // collect columns
+        std::vector<std::string> columns;
+        auto col_it =
+            RiboldMYSQL::constList_iterator<Key_part_spec>(key->columns);
+        for (;;) {
+            const Key_part_spec *const key_part = col_it++;
+            if (nullptr == key_part) {
+                break;
+            }
+
+            columns.push_back(convert_lex_str(key_part->field_name));
+        }
+
+        output.push_back(std::make_tuple(columns, key->type));
+    }
+
+    return output;
 }
 
 //TODO(raluca) : figure out how to create Create_field from scratch
@@ -195,13 +212,13 @@ get_create_field(const Analysis &a, Create_field * const f,
 
     // Default value is handled during INSERTion.
     auto save_default = f->def;
-    f->def = NULL;
+    f->def = nullptr;
 
     const auto &enc_layers = a.getEncLayers(om);
     assert(enc_layers.size() > 0);
-    for (auto it = enc_layers.begin(); it != enc_layers.end(); it++) {
+    for (const auto &it : enc_layers) {
         const Create_field * const old_cf = new_cf;
-        new_cf = (*it)->newCreateField(old_cf, name);
+        new_cf = it->newCreateField(*old_cf, name);
     }
 
     // Restore the default so we don't memleak it.
@@ -217,7 +234,7 @@ rewrite_create_field(const FieldMeta * const fm,
 {
     LOG(cdb_v) << "in rewrite create field for " << *f;
 
-    assert(fm->children.size() > 0);
+    assert(fm->getChildren().size() > 0);
 
     std::vector<Create_field *> output_cfields;
 
@@ -239,11 +256,9 @@ rewrite_create_field(const FieldMeta * const fm,
         Create_field * const f0 = f->clone(thd->mem_root);
         f0->field_name          = thd->strdup(fm->getSaltName().c_str());
         // Salt is unsigned and is not AUTO_INCREMENT.
-        // > NOT_NULL_FLAG is useful for debugging if mysql strict mode
-        //   (ie, STRICT_ALL_TABLES) is turned on.
-        f0->flags               =
-            (f0->flags | UNSIGNED_FLAG | NOT_NULL_FLAG)
-            & ~AUTO_INCREMENT_FLAG;
+        // > salt can only be NOT NULL if column is NOT NULL
+        f0->flags               = (f0->flags | UNSIGNED_FLAG)
+                                  & ~AUTO_INCREMENT_FLAG;
         f0->sql_type            = MYSQL_TYPE_LONGLONG;
         f0->length              = 8;
 
@@ -263,28 +278,28 @@ getOnionIndexTypes()
 }
 
 static std::string
-getOriginalKeyName(Key *const key)
+getOriginalKeyName(const Key &key)
 {
-    if (Key::PRIMARY == key->type) {
+    if (Key::PRIMARY == key.type) {
         return "PRIMARY";
     }
 
-    const std::string out_name = convert_lex_str(key->name);
+    const std::string out_name = convert_lex_str(key.name);
     TEST_TextMessageError(out_name.size() > 0,
                           "Non-Primary keys can not have blank name!");
 
     return out_name;
 }
 
-std::vector<Key *>
-rewrite_key(const TableMeta &tm, Key *const key, const Analysis &a)
+static std::vector<Key *>
+rewrite_key(const TableMeta &tm, const Key &key, const Analysis &a)
 {
     std::vector<Key *> output_keys;
 
     const std::vector<onion> key_onions = getOnionIndexTypes();
     for (auto onion_it : key_onions) {
         const onion o = onion_it;
-        Key *const new_key = key->clone(current_thd->mem_root);
+        Key *const new_key = key.clone(current_thd->mem_root);
 
         // Set anonymous name.
         const std::string new_name =
@@ -294,7 +309,7 @@ rewrite_key(const TableMeta &tm, Key *const key, const Analysis &a)
 
         // Set anonymous columns.
         auto col_it =
-            RiboldMYSQL::constList_iterator<Key_part_spec>(key->columns);
+            RiboldMYSQL::constList_iterator<Key_part_spec>(key.columns);
         for (;;) {
             const Key_part_spec *const key_part = col_it++;
             if (NULL == key_part) {
@@ -320,13 +335,38 @@ rewrite_key(const TableMeta &tm, Key *const key, const Analysis &a)
     }
 
     // Only create one PRIMARY KEY.
-    if (Key::PRIMARY == key->type) {
+    if (Key::PRIMARY == key.type) {
         if (output_keys.size() > 0) {
             return std::vector<Key *>({output_keys.front()});
         }
     }
 
     return output_keys;
+}
+
+// 'seed_lex' and 'out_lex' can be the same object.
+void
+highLevelRewriteKey(const TableMeta &tm, const LEX &seed_lex,
+                    LEX *const out_lex, const Analysis &a)
+{
+    assert(out_lex);
+
+    // Add each new index.
+    auto key_it =
+        List_iterator<Key>(const_cast<LEX &>(seed_lex).alter_info.key_list);
+    out_lex->alter_info.key_list =
+        accumList<Key>(key_it,
+            [&tm, &a] (List<Key> out_list, const Key *const key) {
+                // -----------------------------
+                //         Rewrite INDEX
+                // -----------------------------
+                auto new_keys = rewrite_key(tm, *key, a);
+                out_list.concat(vectorToListWithTHD(new_keys));
+
+                return out_list;    /* lambda */
+        });
+
+    return;
 }
 
 std::string
@@ -351,31 +391,50 @@ string_to_bool(const std::string &s)
     }
 }
 
+static bool
+isUnique(const std::string &name,
+         const std::vector<std::tuple<std::vector<std::string>, Key::Keytype> > &
+             key_data)
+{
+    bool unique = false;
+    for (const auto &it : key_data) {
+        const auto &found =
+            std::find(std::get<0>(it).begin(), std::get<0>(it).end(), name);
+        if (found != std::get<0>(it).end()
+            && (std::get<1>(it) == Key::PRIMARY || std::get<1>(it) == Key::UNIQUE)) {
+            unique = true;
+            break;
+        }
+    }
+
+    return unique;
+}
+
 List<Create_field>
-createAndRewriteField(Analysis &a, const ProxyState &ps,
-                      Create_field * const cf,
+createAndRewriteField(Analysis &a, Create_field * const cf,
                       TableMeta *const tm, bool new_table,
+                      const std::vector<std::tuple<std::vector<std::string>,
+                                        Key::Keytype> >
+                          &key_data,
                       List<Create_field> &rewritten_cfield_list)
 {
-    const std::string name = std::string(cf->field_name);
-    auto buildFieldMeta =
-        [] (const std::string name, Create_field * const cf,
-            const ProxyState &ps, TableMeta *const tm)
-    {
-        return new FieldMeta(name, cf, ps.getMasterKey().get(),
-                             ps.defaultSecurityRating(),
-                             tm->leaseIncUniq());
-    };
-    std::unique_ptr<FieldMeta> fm(buildFieldMeta(name, cf, ps, tm));
+    // we only support the creation of UNSIGNED fields
+    cf->flags = cf->flags | UNSIGNED_FLAG;
+
+    const std::string &name = std::string(cf->field_name);
+    std::unique_ptr<FieldMeta>
+        fm(new FieldMeta(*cf, a.getMasterKey().get(),
+                         a.getDefaultSecurityRating(), tm->leaseCount(),
+                         isUnique(name, key_data)));
 
     // -----------------------------
-    //         Rewrite FIELD       
+    //         Rewrite FIELD
     // -----------------------------
     const auto new_fields = rewrite_create_field(fm.get(), cf, a);
     rewritten_cfield_list.concat(vectorToListWithTHD(new_fields));
 
     // -----------------------------
-    //         Update FIELD       
+    //         Update FIELD
     // -----------------------------
 
     // Here we store the key name for the first time. It will be applied
@@ -405,10 +464,10 @@ encrypt_item_layers(const Item &i, onion o, const OnionMeta &om,
     const Item *enc = &i;
     Item *new_enc = NULL;
 
-    for (auto it = enc_layers.begin(); it != enc_layers.end(); it++) {
+    for (const auto &it : enc_layers) {
         LOG(encl) << "encrypt layer "
-                  << TypeText<SECLEVEL>::toText((*it)->level()) << "\n";
-        new_enc = (*it)->encrypt(*enc, IV);
+                  << TypeText<SECLEVEL>::toText(it->level()) << "\n";
+        new_enc = it->encrypt(*enc, IV);
         assert(new_enc);
         enc = new_enc;
     }
@@ -416,22 +475,6 @@ encrypt_item_layers(const Item &i, onion o, const OnionMeta &om,
     // @i is const, do we don't want the caller to modify it accidentally.
     assert(new_enc && new_enc != &i);
     return new_enc;
-}
-
-std::string
-rewriteAndGetSingleQuery(const ProxyState &ps, const std::string &q,
-                         SchemaInfo const &schema,
-                         const std::string &default_db)
-{
-    const QueryRewrite qr(Rewriter::rewrite(ps, q, schema, default_db));
-    assert(false == qr.output->stalesSchema());
-    assert(QueryAction::VANILLA == qr.output->queryAction(ps.getConn()));
-
-    std::list<std::string> out_queryz;
-    qr.output->getQuery(&out_queryz, schema);
-    assert(out_queryz.size() == 1);
-
-    return out_queryz.back();
 }
 
 std::string
@@ -469,12 +512,6 @@ typical_rewrite_insert_type(const Item &i, const FieldMeta &fm,
     if (fm.getHasSalt()) {
         l->push_back(new Item_int(static_cast<ulonglong>(salt)));
     }
-}
-
-std::string
-mysql_noop()
-{
-    return "do 0;";
 }
 
 /*
@@ -531,41 +568,6 @@ retrieveDefaultDatabase(unsigned long long thread_id,
     return true;
 }
 
-void
-queryPreamble(const ProxyState &ps, const std::string &q,
-              std::unique_ptr<QueryRewrite> *const qr,
-              std::list<std::string> *const out_queryz,
-              SchemaCache *const schema_cache,
-              const std::string &default_db)
-{
-    const SchemaInfo &schema =
-        schema_cache->getSchema(ps.getConn(), ps.getEConn());
-
-    *qr = std::unique_ptr<QueryRewrite>(
-            new QueryRewrite(Rewriter::rewrite(ps, q, schema,
-                                               default_db)));
-
-    // We handle before any queries because a failed query
-    // may stale the database during recovery and then
-    // we'd have to handle there as well.
-    schema_cache->updateStaleness(ps.getEConn(),
-                                  (*qr)->output->stalesSchema());
-
-    // ASK bites again...
-    // We want the embedded database to reflect the metadata for the
-    // current remote connection.
-    if ((*qr)->output->usesEmbeddedDB()) {
-        TEST_TextMessageError(lowLevelSetCurrentDatabase(ps.getEConn(),
-                                                         default_db),
-                              "Failed to set default embedded database!");
-    }
-
-    (*qr)->output->beforeQuery(ps.getConn(), ps.getEConn());
-    (*qr)->output->getQuery(out_queryz, schema);
-
-    return;
-}
-
 /*
 static void
 printEC(std::unique_ptr<Connect> e_conn, const std::string & command) {
@@ -576,9 +578,9 @@ printEC(std::unique_ptr<Connect> e_conn, const std::string & command) {
 }
 */
 
+/*
 static void
 printEmbeddedState(const ProxyState &ps) {
-/*
     printEC(ps.e_conn, "show databases;");
     printEC(ps.e_conn, "show tables from pdb;");
     std::cout << "regular" << std::endl << std::endl;
@@ -587,17 +589,33 @@ printEmbeddedState(const ProxyState &ps) {
     printEC(ps.e_conn, "select * from pdb.BleedingMetaObject;");
     printEC(ps.e_conn, "select * from pdb.Query;");
     printEC(ps.e_conn, "select * from pdb.DeltaOutput;");
-*/
 }
+*/
 
+std::string
+terminalEscape(const std::string &s)
+{
+    std::string out;
+    for (auto it : s) {
+        if (isprint(it)) {
+            out.push_back(it);
+            continue;
+        }
+
+        out.push_back('?');
+    }
+
+    return out;
+}
 
 void
 prettyPrintQuery(const std::string &query)
 {
     std::cout << std::endl << RED_BEGIN
-              << "QUERY: " << COLOR_END << query << std::endl;
+              << "QUERY: " << COLOR_END << terminalEscape(query) << std::endl;
 }
 
+/*
 static void
 prettyPrintQueryResult(const ResType &res)
 {
@@ -606,156 +624,27 @@ prettyPrintQueryResult(const ResType &res)
     printRes(res);
     std::cout << std::endl;
 }
+*/
 
-EpilogueResult
-queryEpilogue(const ProxyState &ps, const QueryRewrite &qr,
-              const ResType &res, const std::string &query,
-              const std::string &default_db, bool pp)
+SECURITY_RATING
+determineSecurityRating()
 {
-    qr.output->afterQuery(ps.getEConn());
-
-    const QueryAction action = qr.output->queryAction(ps.getConn());
-    if (QueryAction::AGAIN == action) {
-        std::unique_ptr<SchemaCache> schema_cache(new SchemaCache());
-        const EpilogueResult &epi_res =
-            executeQuery(ps, query, default_db, schema_cache.get(), pp);
-        TEST_Sync(schema_cache->cleanupStaleness(ps.getEConn()),
-                  "failed to cleanup cache after requery!");
-        return epi_res;
+    const char *const secure = getenv("SECURE_CRYPTDB");
+    if (secure && equalsIgnoreCase("FALSE", secure)) {
+        return SECURITY_RATING::BEST_EFFORT;
     }
-
-    if (pp) {
-        printEmbeddedState(ps);
-        prettyPrintQueryResult(res);
-    }
-
-    if (qr.output->doDecryption()) {
-        const ResType &dec_res =
-            Rewriter::decryptResults(res, qr.rmeta);
-        assert(dec_res.success());
-        if (pp) {
-            prettyPrintQueryResult(dec_res);
-        }
-
-        return EpilogueResult(action, dec_res);
-    }
-
-    return EpilogueResult(action, res);
-}
-
-static bool
-lowLevelGetCurrentStaleness(const std::unique_ptr<Connect> &e_conn,
-                            unsigned int cache_id)
-{
-    const std::string &query =
-        " SELECT stale FROM " + MetaData::Table::staleness() +
-        "  WHERE cache_id = " + std::to_string(cache_id) + ";";
-    std::unique_ptr<DBResult> db_res;
-    TEST_TextMessageError(e_conn->execute(query, &db_res),
-                          "failed to get schema!");
-    assert(1 == mysql_num_rows(db_res->n));
-
-    const MYSQL_ROW row = mysql_fetch_row(db_res->n);
-    const unsigned long *const l = mysql_fetch_lengths(db_res->n);
-    assert(l != NULL);
-
-    return string_to_bool(std::string(row[0], l[0]));
-}
-
-const SchemaInfo &
-SchemaCache::getSchema(const std::unique_ptr<Connect> &conn,
-                       const std::unique_ptr<Connect> &e_conn)
-{
-    if (true == this->no_loads) {
-        // Use this cleanup if we can't maintain consistent states.
-        /*
-        TEST_TextMessageError(cleanupStaleness(e_conn),
-                              "Failed to cleanup staleness for first"
-                              " usage!");
-        */
-        TEST_TextMessageError(initialStaleness(e_conn),
-                              "Failed to initialize staleness for first"
-                              " usage!");
-        this->no_loads = false;
-    }
-    const bool stale = lowLevelGetCurrentStaleness(e_conn, this->id);
-
-    if (true == stale) {
-        this->schema.reset(loadSchemaInfo(conn, e_conn));
-    }
-
-    assert(this->schema);
-    return *this->schema.get();
-}
-
-static void
-lowLevelAllStale(const std::unique_ptr<Connect> &e_conn)
-{
-    const std::string &query =
-        " UPDATE " + MetaData::Table::staleness() +
-        "    SET stale = TRUE;";
-
-    TEST_TextMessageError(e_conn->execute(query),
-                          "failed to all stale!");
-}
-
-void
-SchemaCache::updateStaleness(const std::unique_ptr<Connect> &e_conn,
-                             bool staleness)
-{
-    if (true == staleness) {
-        // Make everyone stale.
-        lowLevelAllStale(e_conn);
-    } else {
-        // We are no longer stale.
-        this->lowLevelCurrentUnstale(e_conn);
-    }
+    
+    return SECURITY_RATING::SENSITIVE;
 }
 
 bool
-SchemaCache::initialStaleness(const std::unique_ptr<Connect> &e_conn)
+handleActiveTransactionPResults(const ResType &res)
 {
-    const std::string seed_staleness =
-        " INSERT INTO " + MetaData::Table::staleness() +
-        "   (cache_id, stale) VALUES " +
-        "   (" + std::to_string(this->id) + ", TRUE);";
-    RETURN_FALSE_IF_FALSE(e_conn->execute(seed_staleness));
+    assert(res.success());
+    assert(res.rows.size() == 1);
 
-    return true;
-}
-
-bool
-SchemaCache::cleanupStaleness(const std::unique_ptr<Connect> &e_conn)
-{
-    const std::string remove_staleness =
-        " DELETE FROM " + MetaData::Table::staleness() +
-        "       WHERE cache_id = " + std::to_string(this->id) + ";";
-    RETURN_FALSE_IF_FALSE(e_conn->execute(remove_staleness));
-
-    return true;
-}
-static void
-lowLevelToggleCurrentStaleness(const std::unique_ptr<Connect> &e_conn,
-                               unsigned int cache_id, bool staleness)
-{
-    const std::string &query =
-        " UPDATE " + MetaData::Table::staleness() +
-        "    SET stale = " + bool_to_string(staleness) +
-        "  WHERE cache_id = " + std::to_string(cache_id) + ";";
-
-    TEST_TextMessageError(e_conn->execute(query),
-                          "failed to unstale current!");
-}
-
-void
-SchemaCache::lowLevelCurrentStale(const std::unique_ptr<Connect> &e_conn)
-{
-    lowLevelToggleCurrentStaleness(e_conn, this->id, true);
-}
-
-void
-SchemaCache::lowLevelCurrentUnstale(const std::unique_ptr<Connect> &e_conn)
-{
-    lowLevelToggleCurrentStaleness(e_conn, this->id, false);
+    const std::string &trx = ItemToString(*res.rows.front().front());
+    assert("1" == trx || "0" == trx);
+    return ("1" == trx);
 }
 

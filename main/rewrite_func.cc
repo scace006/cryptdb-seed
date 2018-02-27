@@ -22,6 +22,28 @@
 #include <util/enum_text.hh>
 #include <parser/lex_util.hh>
 
+#define PLAIN_FUNCTION(type, name)                                      \
+namespace {                                                             \
+    extern const char __str_name_##name[] = #name;                      \
+    static class ANON : public CItemSubtypeFN<type, __str_name_##name> {\
+        virtual RewritePlan *                                           \
+        do_gather_type(const type &i, Analysis &a) const                \
+        {                                                               \
+            const std::string &why = #name;                             \
+            return allPlainIterateGather(i, why, a);                    \
+        }                                                               \
+                                                                        \
+        virtual Item *                                                  \
+        do_rewrite_type(const type &i, const OLK &constr,               \
+                        const RewritePlan &rp, Analysis &a) const       \
+        {                                                               \
+            return rewrite_args_FN(i, constr,                           \
+                                   static_cast<const RewritePlanOneOLK &>(rp),  \
+                                   a);                                  \
+        }                                                               \
+    } ANON;                                                             \
+};
+
 // gives names to classes and objects we don't care to know the name of 
 #define ANON                ANON_NAME(__anon_id_func_)
 
@@ -66,6 +88,28 @@ rewrite_args_FN(const T &i, const OLK &constr,
     }
 
     return out_i;
+}
+
+static RewritePlan *
+friendlyGather(Analysis &a, const Item_func &i, const EncSet &filter_es,
+               const std::string &why)
+{
+    const unsigned int arg_count = i.argument_count();
+    TEST_BadItemArgumentCount(i.type(), 2, arg_count);
+
+    Item *const *const args = i.arguments();
+    std::vector<std::shared_ptr<RewritePlan> >
+        childr_rp({std::shared_ptr<RewritePlan>(gather(*args[0], a)),
+                   std::shared_ptr<RewritePlan>(gather(*args[1], a))});
+
+    const EncSet solution =
+        filter_es.intersect(childr_rp[0]->es_out).
+                  intersect(childr_rp[1]->es_out);
+    TEST_NoAvailableEncSet(solution, i.type(), filter_es, why, childr_rp);
+
+    const reason rsn(solution, why, i);
+
+    return new RewritePlanWithChildren(solution, rsn, childr_rp);
 }
 
 // An implementation of gather for the common case operation
@@ -448,7 +492,7 @@ class CItemAdditive : public CItemSubtypeFN<IT, NAME> {
     do_gather_type(const IT &i, Analysis &a) const
     {
         const std::string why = NAME;
-        return typical_gather(a, i, ADD_EncSet, why, true);
+        return friendlyGather(a, i, ADD_EncSet, why);
     }
 
     virtual Item * do_optimize_type(IT *i, Analysis & a) const
@@ -467,8 +511,8 @@ class CItemAdditive : public CItemSubtypeFN<IT, NAME> {
         TEST_BadItemArgumentCount(i.type(), 2, i.argument_count());
         Item *const *const args = i.arguments();
 
-        const RewritePlanOneOLK &rp =
-            static_cast<const RewritePlanOneOLK &>(_rp);
+        const RewritePlanWithChildren &rp =
+            static_cast<const RewritePlanWithChildren &>(_rp);
 
         LOG(cdb_v) << "Rewrite plan is " << &rp << std::endl;
 
@@ -479,14 +523,23 @@ class CItemAdditive : public CItemSubtypeFN<IT, NAME> {
             itemTypes.do_rewrite(*args[1], constr,
                                  *rp.childr_rp[1].get(), a);
 
-        if (oAGG == constr.o) {
-            OnionMeta *const om = rp.olk.key->getOnionMeta(oAGG);
+        const EncSet chose_encset = rp.es_out.intersect(EncSet(constr));
+        const OLK olk = chose_encset.chooseOne();
+        TEST_Text(OLK::isNotInvalid(olk),
+                  "no valid EncSet available for Addition/Subtraction");
+
+        switch (olk.o) {
+        case oAGG: {
+            TEST_Text(olk.key, "fail");
+
+            OnionMeta *const om = olk.key->getOnionMeta(oAGG);
             assert(om);
             EncLayer const &el = a.getBackEncLayer(*om);
             TEST_UnexpectedSecurityLevel(oAGG, SECLEVEL::HOM,
                                          el.level());
             return static_cast<const HOM &>(el).sumUDF(arg0, arg1);
-        } else {
+        }
+        default:
             return new IT(arg0, arg1);
         }
     }
@@ -941,7 +994,6 @@ class CItemMinMax : public CItemSubtypeFN<Item_func_min_max, FN> {
         return do_optimize_type_self_and_args(i, a);
     }
 
-    //FIXME: Cleanup.
     virtual Item *
     do_rewrite_type(const Item_func_min_max &i, const OLK &constr,
                     const RewritePlan &_rp, Analysis &a) const
@@ -966,13 +1018,34 @@ class CItemMinMax : public CItemSubtypeFN<Item_func_min_max, FN> {
             i.*rob<Item_func_min_max, int,
                     &Item_func_min_max::cmp_sign>::ptr();
 
-        Item *const cond =
-            cmp_sign ? static_cast<Item *>(new
-                            Item_func_gt(cond_arg0, cond_arg1))
-                     : static_cast<Item *>(new
-                            Item_func_lt(cond_arg0, cond_arg1));
+        AssignOnce<Item *> cond;
+        if (-1 == cmp_sign) {
+            cond = new Item_func_gt(cond_arg0, cond_arg1);
+        } else if (1 == cmp_sign) {
+            cond = new Item_func_lt(cond_arg0, cond_arg1);
+        } else {
+            FAIL_TextMessageError("unknown comparison type with"
+                                  " Item_func_min_max");
+        }
 
-        return new Item_func_if(cond,
+        // this monstrosity forces us to lower the DET onion from RND because
+        // we do not handle cases where a projection is not _just_ a field
+        // and requires a salt
+        // > EXCEPT: when we are being called from inside a SUM(...) function
+        //   'summation_hack'
+        FieldMeta *const fm = rp.olk.key;
+        if (fm
+            && false == a.summation_hack
+            && SECLEVEL::RND <= a.getOnionLevel(*fm, oDET)) {
+
+            const DatabaseMeta &dm = a.getDatabaseMeta(a.getDatabaseName());
+            const TableMeta *const tm = dm.getChildWithGChild(*fm);
+            if (tm) {
+                throw OnionAdjustExcept(*tm, *fm, oDET, SECLEVEL::DET);
+            }
+        }
+
+        return new Item_func_if(cond.get(),
                                 itemTypes.do_rewrite(*args[0], constr,
                                                 *rp.childr_rp[0].get(),
                                                 a),
@@ -981,8 +1054,6 @@ class CItemMinMax : public CItemSubtypeFN<Item_func_min_max, FN> {
                                                 a));
     }
 };
-
-//TODO: do we still need the file analyze.cc?
 
 extern const char str_greatest[] = "greatest";
 static CItemMinMax<str_greatest, Item_func_max> ANON;
@@ -997,11 +1068,11 @@ static class ANON : public CItemSubtypeFN<Item_func_strcmp, str_strcmp> {
     do_gather_type(const Item_func_strcmp &i, Analysis &a) const
     {
         //cerr << "do_a_t Item_func_strcmp reason " << tr << "\n";
-	/* Item **args = i->arguments();
-        for (uint x = 0; x < i->argument_count(); x++)
-            analyze(args[x], reason(EQ_EncSet, "strcmp", i, &tr), a);
-        return tr.encset;
-	*/
+        /* Item **args = i->arguments();
+            for (uint x = 0; x < i->argument_count(); x++)
+                analyze(args[x], reason(EQ_EncSet, "strcmp", i, &tr), a);
+            return tr.encset;
+        */
         UNIMPLEMENTED;
     }
     virtual Item * do_optimize_type(Item_func_strcmp *i, Analysis & a) const
@@ -1106,6 +1177,9 @@ static class ANON : public CItemSubtypeFN<Item_func_case, str_case> {
     virtual RewritePlan *
     do_gather_type(const Item_func_case &i, Analysis &a) const
     {
+        const std::string &why = str_case;
+        return allPlainIterateGather(i, why, a);
+
 	/*     Item **args = i->arguments();
         int first_expr_num = i->*rob<Item_func_case, int,
                 &Item_func_case::first_expr_num>::ptr();
@@ -1137,6 +1211,14 @@ static class ANON : public CItemSubtypeFN<Item_func_case, str_case> {
     virtual Item * do_optimize_type(Item_func_case *i, Analysis & a) const
     {
         return do_optimize_type_self_and_args(i, a);
+    }
+
+    virtual Item *
+    do_rewrite_type(const Item_func_case &i, const OLK &constr,
+                    const RewritePlan &rp, Analysis &a) const
+    {
+        return rewrite_args_FN(i, constr,
+                               static_cast<const RewritePlanOneOLK &>(rp), a);
     }
 } ANON;
 
@@ -1237,7 +1319,7 @@ extern const char str_regexp[] = "regexp";
 static CItemStrconv<str_regexp> ANON;
  
 extern const char str_date_add_interval[] = "date_add_interval";
-// Use encryption/rewriting.
+// FIXME: Use encryption/rewriting.
 static class ANON : public CItemSubtypeFN<Item_date_add_interval, str_date_add_interval> {
     virtual RewritePlan *
     do_gather_type(const Item_date_add_interval &i, Analysis &a) const
@@ -1343,3 +1425,30 @@ static CItemFuncMiscPlain<str_cast_as_unsigned> ANON;
 
 extern const char str_cast_as_signed[] = "cast_as_signed";
 static CItemFuncMiscPlain<str_cast_as_signed> ANON;
+
+extern const char str_current_user[] = "current_user";
+static class ANON : public CItemSubtypeFN<Item_func_current_user,
+                                          str_current_user> {
+    virtual RewritePlan *
+    do_gather_type(const Item_func_current_user &i, Analysis &a) const
+    {
+        const EncSet out_es = PLAIN_EncSet;
+        const EncSet child_es = PLAIN_EncSet;
+        const std::string why = str_current_user;
+
+        return allPlainIterateGather(i, why, a);
+    }
+
+    virtual Item *
+    do_rewrite_type(const Item_func_current_user &i, const OLK &constr,
+                    const RewritePlan &rp, Analysis &a) const
+    {
+        return rewrite_args_FN(i, constr,
+                               static_cast<const RewritePlanOneOLK &>(rp),
+                               a);
+    }
+} ANON;
+
+PLAIN_FUNCTION(Item_func_connection_id, connection_id);
+
+#undef PLAIN_FUNCTION

@@ -4,23 +4,33 @@
 #include <parser/lex_util.hh>
 #include <util/enum_text.hh>
 
+// ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+//     These handlers expect a LEX that they
+//            can update in place.
+// ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
 class AddColumnSubHandler : public AlterSubHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps,
-                                  const Preamble &preamble) const
+    virtual LEX *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &preamble)
+            const
     {
         TableMeta &tm = a.getTableMeta(preamble.dbname, preamble.table);
+
+        // collect the keys (and their types) as they may affect the onion
+        // layout we use
+        const auto &key_data = collectKeyData(*lex);
 
         // Create *Meta objects.
         auto add_it =
             List_iterator<Create_field>(lex->alter_info.create_list);
         lex->alter_info.create_list =
             accumList<Create_field>(add_it,
-                [&a, &ps, &tm] (List<Create_field> out_list,
-                                Create_field *cf)
+                [&a, &tm, &key_data] (List<Create_field> out_list,
+                                      Create_field *cf)
             {
-                    return createAndRewriteField(a, ps, cf, &tm,
-                                                 false, out_list);
+                    return createAndRewriteField(a, cf, &tm, false, key_data,
+                                                 out_list);
             });
 
         return lex;
@@ -28,9 +38,9 @@ class AddColumnSubHandler : public AlterSubHandler {
 };
 
 class DropColumnSubHandler : public AlterSubHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps,
-                                  const Preamble &preamble) const
+    virtual LEX *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &preamble)
+            const
     {
         // Get the column drops.
         auto drop_it =
@@ -49,11 +59,9 @@ class DropColumnSubHandler : public AlterSubHandler {
                 [preamble, &a, this] (List<Alter_drop> out_list,
                                             Alter_drop *adrop)
         {
-            FieldMeta const &fm =
-                a.getFieldMeta(preamble.dbname, preamble.table,
-                               adrop->name);
             TableMeta const &tm =
                 a.getTableMeta(preamble.dbname, preamble.table);
+            FieldMeta const &fm = a.getFieldMeta(tm, adrop->name);
             List<Alter_drop> lst = this->rewrite(fm, adrop);
             out_list.concat(&lst);
             a.deltas.push_back(std::unique_ptr<Delta>(
@@ -67,13 +75,12 @@ class DropColumnSubHandler : public AlterSubHandler {
     List<Alter_drop> rewrite(FieldMeta const &fm, Alter_drop *adrop) const
     {
         List<Alter_drop> out_list;
-        THD *thd = current_thd;
+        THD *const thd = current_thd;
 
         // Rewrite each onion column.
-        for (auto om_it = fm.children.begin(); om_it != fm.children.end();
-             om_it++) {
+        for (const auto &om_it : fm.getChildren()) {
             Alter_drop * const new_adrop = adrop->clone(thd->mem_root);
-            OnionMeta *const om = (*om_it).second.get();
+            OnionMeta *const om = om_it.second.get();
             new_adrop->name =
                 thd->strdup(om->getAnonOnionName().c_str());
             out_list.push_back(new_adrop);
@@ -92,54 +99,41 @@ class DropColumnSubHandler : public AlterSubHandler {
 };
 
 class ChangeColumnSubHandler : public AlterSubHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps,
-                                  const Preamble &preamble) const
+    virtual LEX *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &preamble)
+            const
     {
-        assert(false);
+        FAIL_TextMessageError("implement ChangeColumnSubHandler");
     }
 };
 
 class ForeignKeySubHandler : public AlterSubHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps,
-                                  const Preamble &preamble) const
+    virtual LEX *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &preamble)
+            const
     {
-        throw CryptDBError("implement ForeignKeySubHandler!");
+        FAIL_TextMessageError("implement ForeignKeySubHandler");
     }
 };
 
 class AddIndexSubHandler : public AlterSubHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps,
-                                  const Preamble &preamble) const
+    virtual LEX *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &preamble)
+            const
     {
         TableMeta const &tm =
             a.getTableMeta(preamble.dbname, preamble.table);
 
-        // Add each new index.
-        auto key_it =
-            List_iterator<Key>(lex->alter_info.key_list);
-        lex->alter_info.key_list =
-            accumList<Key>(key_it,
-                [&tm, &a] (List<Key> out_list, Key *const key) {
-                    // -----------------------------
-                    //         Rewrite INDEX
-                    // -----------------------------
-                    auto new_keys = rewrite_key(tm, key, a);
-                    out_list.concat(vectorToListWithTHD(new_keys));
-
-                    return out_list;    /* lambda */
-            });
+        highLevelRewriteKey(tm, *lex, lex, a);
 
         return lex;
     }
 };
 
 class DropIndexSubHandler : public AlterSubHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps,
-                                  const Preamble &preamble) const
+    virtual LEX *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &preamble)
+            const
     {
         TableMeta const &tm =
             a.getTableMeta(preamble.dbname, preamble.table);
@@ -179,10 +173,6 @@ class DropIndexSubHandler : public AlterSubHandler {
         const std::vector<onion> key_onions = getOnionIndexTypes();
         for (auto onion_it : key_onions) {
             const onion o = onion_it;
-            // HACK.
-            if (oPLAIN == o) {
-                continue;
-            }
             Alter_drop *const new_adrop =
                 adrop->clone(current_thd->mem_root);
             new_adrop->name =
@@ -208,22 +198,22 @@ class DropIndexSubHandler : public AlterSubHandler {
 };
 
 class DisableOrEnableKeys : public AlterSubHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *const lex,
-                                  const ProxyState &ps,
-                                  const Preamble &preamble) const
+    virtual LEX *
+        rewriteAndUpdate(Analysis &a, LEX *const lex,
+                         const Preamble &preamble) const
     {
         return lex;
     }
 };
 
-LEX *AlterSubHandler::transformLex(Analysis &a, LEX *lex,
-                                   const ProxyState &ps) const
+LEX *AlterSubHandler::
+transformLex(Analysis &a, LEX *const lex) const
 {
     const std::string &db = lex->select_lex.table_list.first->db;
     TEST_DatabaseDiscrepancy(db, a.getDatabaseName());
     const Preamble preamble(db,
                             lex->select_lex.table_list.first->table_name);
-    return this->rewriteAndUpdate(a, lex, ps, preamble);
+    return this->rewriteAndUpdate(a, lex, preamble);
 }
 
 AlterDispatcher *buildAlterSubDispatcher() {

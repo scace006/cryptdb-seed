@@ -22,19 +22,28 @@ SQLDispatcher::extract(LEX *const lex) const
     return lex->sql_command;
 }
 
-// FIXME: Implement.
 bool
 AlterDispatcher::canDo(LEX *const lex) const
 {
-    return true;
+    // there must be a command for us to do
+    if (0 == lex->alter_info.flags) {
+        return false;
+    }
+
+    long long flags = lex->alter_info.flags;
+    for (const auto &it : handlers) {
+        flags -= lex->alter_info.flags & it.first;
+    }
+
+    return 0 == flags;
 }
 
 std::vector<AlterSubHandler *>
 AlterDispatcher::dispatch(LEX *const lex) const
 {
     std::vector<AlterSubHandler *> out;
-    for (auto it = handlers.begin(); it != handlers.end(); it++) {
-        long long extract = lex->alter_info.flags & (*it).first;
+    for (const auto &it : handlers) {
+        const long long extract = lex->alter_info.flags & it.first;
         if (extract) {
             auto it_handler = handlers.find(extract);
             assert(handlers.end() != it_handler && it_handler->second);

@@ -5,10 +5,12 @@
 #include <main/rewrite_main.hh>
 #include <main/Analysis.hh>
 #include <main/rewrite_ds.hh>
+#include <main/schema.hh>
 
 #include <sql_list.h>
 #include <sql_table.h>
 
+const bool PRETTY_DEMO = true;
 const std::string BOLD_BEGIN = "\033[1m";
 const std::string RED_BEGIN = "\033[1;31m";
 const std::string GREEN_BEGIN = "\033[1;92m";
@@ -40,18 +42,16 @@ gatherAndAddAnalysisRewritePlan(const Item &i, Analysis &a);
 void
 optimize(Item ** const i, Analysis &a);
 
-LEX *
-begin_transaction_lex(const std::string &dbname);
-
-LEX *
-commit_transaction_lex(const std::string &dbname);
+std::vector<std::tuple<std::vector<std::string>, Key::Keytype> >
+collectKeyData(const LEX &lex);
 
 std::vector<Create_field *>
 rewrite_create_field(const FieldMeta * const fm, Create_field * const f,
                      const Analysis &a);
 
-std::vector<Key *>
-rewrite_key(const TableMeta &tm, Key * const key, const Analysis &a);
+void
+highLevelRewriteKey(const TableMeta &tm, const LEX &seed_lex,
+                    LEX *const out_lex, const Analysis &a);
 
 std::string
 bool_to_string(bool b);
@@ -59,19 +59,16 @@ bool_to_string(bool b);
 bool string_to_bool(const std::string &s);
 
 List<Create_field>
-createAndRewriteField(Analysis &a, const ProxyState &ps,
-                      Create_field * const cf,
+createAndRewriteField(Analysis &a, Create_field * const cf,
                       TableMeta *const tm, bool new_table,
+                      const std::vector<std::tuple<std::vector<std::string>,
+                                        Key::Keytype> >
+                          &key_data,
                       List<Create_field> &rewritten_cfield_list);
 
 Item *
 encrypt_item_layers(const Item &i, onion o, const OnionMeta &om,
                     const Analysis &a, uint64_t IV = 0);
-
-std::string
-rewriteAndGetSingleQuery(const ProxyState &ps, const std::string &q,
-                         SchemaInfo const &schema,
-                         const std::string &default_db);
 
 // FIXME(burrows): Generalize to support any container with next AND end
 // semantics.
@@ -80,9 +77,8 @@ std::string vector_join(std::vector<T> v, const std::string &delim,
                         const std::function<std::string(T)> &finalize)
 {
     std::string accum;
-    for (typename std::vector<T>::iterator it = v.begin();
-         it != v.end(); ++it) {
-        const std::string &element = finalize(static_cast<T>(*it));
+    for (const auto &it : v) {
+        const std::string &element = finalize(static_cast<T>(it));
         accum.append(element);
         accum.append(delim);
     }
@@ -95,6 +91,14 @@ std::string vector_join(std::vector<T> v, const std::string &delim,
     }
 
     return output.get();
+}
+
+static std::string identity(std::string s) {return s;}
+
+inline std::string
+vector_join(std::vector<std::string> v, const std::string &delim)
+{
+    return vector_join<std::string>(v, delim, identity);
 }
 
 std::string
@@ -122,9 +126,6 @@ st_select_lex *
 rewrite_select_lex(const st_select_lex &select_lex, Analysis &a);
 
 std::string
-mysql_noop();
-
-std::string
 getDefaultDatabaseForConnection(const std::unique_ptr<Connect> &c);
 
 bool
@@ -132,52 +133,16 @@ retrieveDefaultDatabase(unsigned long long thread_id,
                         const std::unique_ptr<Connect> &c,
                         std::string *const out_name);
 
-void
-queryPreamble(const ProxyState &ps, const std::string &q,
-              std::unique_ptr<QueryRewrite> *qr,
-              std::list<std::string> *const out_queryz,
-              SchemaCache *const schema,
-              const std::string &default_db);
-
-bool
-queryHandleRollback(const ProxyState &ps, const std::string &query,
-                    SchemaInfo const &schema);
+std::string terminalEscape(const std::string &s);
 
 void
 prettyPrintQuery(const std::string &query);
 
-class EpilogueResult {
-public:
-    EpilogueResult(QueryAction action, const ResType &res_type)
-        : action(action), res_type(res_type) {}
+SECURITY_RATING
+determineSecurityRating();
 
-    const QueryAction action;
-    const ResType res_type;
-};
-
-EpilogueResult
-queryEpilogue(const ProxyState &ps, const QueryRewrite &qr,
-              const ResType &res, const std::string &query,
-              const std::string &default_db, bool pp);
-
-class SchemaCache {
-public:
-    SchemaCache() : no_loads(true), id(randomValue() % UINT_MAX) {}
-
-    const SchemaInfo &getSchema(const std::unique_ptr<Connect> &conn,
-                                const std::unique_ptr<Connect> &e_conn);
-    void updateStaleness(const std::unique_ptr<Connect> &e_conn,
-                         bool staleness);
-    bool initialStaleness(const std::unique_ptr<Connect> &e_conn);
-    bool cleanupStaleness(const std::unique_ptr<Connect> &e_conn);
-    void lowLevelCurrentStale(const std::unique_ptr<Connect> &e_conn);
-    void lowLevelCurrentUnstale(const std::unique_ptr<Connect> &e_conn);
-
-private:
-    std::unique_ptr<const SchemaInfo> schema;
-    bool no_loads;
-    const unsigned int id;
-};
+bool
+handleActiveTransactionPResults(const ResType &res);
 
 template <typename InType, typename InterimType, typename OutType>
 std::function<OutType(InType in)>

@@ -28,6 +28,16 @@
 #include <util/errstream.hh>
 #include <util/params.hh>
 
+#define RETURN_FALSE_IF_FALSE(status)       \
+{                                           \
+    if (!(status)) {                        \
+        return false;                       \
+    }                                       \
+}
+
+#define RFIF RETURN_FALSE_IF_FALSE
+
+
 // ==== CONSTANTS ============== //
 
 #define SVAL2(s) #s
@@ -374,6 +384,9 @@ std::string toUpperCase(const std::string &token);
 
 bool equalsIgnoreCase(const std::string &s1, const std::string &s2);
 
+std::string leadingZeros(const std::string &input, size_t count);
+std::string trailingZeros(const std::string &input, size_t count);
+
 //performs a case insensitive search
 template<class T>
 bool contains(const std::string &token, const T &values)
@@ -434,17 +447,17 @@ public:
         if (true == frozen) {
             throw CryptDBError("Object has already been assigned to!");
         } else {
-            this->value = value;
+            this->value = new T(value);
             frozen = true;
             return *this;
         }
     }
 
-    const T get() const {
+    const T &get() const {
         if (false == frozen) {
             throw CryptDBError("First assign to AssignOnce template!");
         }
-        return value;
+        return *value;
     }
 
     bool assigned() const {
@@ -452,7 +465,7 @@ public:
     }
 
 private:
-    T value;
+    T *value;
     bool frozen;
 };
 
@@ -572,6 +585,36 @@ private:
     const std::function<void(void)> fn;
 };
 
+template <typename Type>
+class ScopedAssignment {
+    ScopedAssignment() = delete;
+    ScopedAssignment(const ScopedAssignment &a) = delete;
+    ScopedAssignment(ScopedAssignment &&a) = delete;
+    ScopedAssignment &operator=(const ScopedAssignment &a) = delete;
+    ScopedAssignment &operator=(ScopedAssignment &&a) = delete;
+
+    Type *const addr;
+    Type &old_value;
+
+public:
+    ScopedAssignment(Type *const addr, Type &&temp_value,
+                     std::function<void(void)> lambda) :
+        addr(addr), old_value(*addr)
+    {
+        *addr = temp_value;
+        lambda();
+        *addr = old_value;
+    }
+};
+
+class NormalAlloc {
+public:
+    NormalAlloc() {}
+    virtual ~NormalAlloc() {}
+
+    void *operator new(size_t n);
+    void operator delete(void *const p);
+};
 
 // Taken from jsmith @ cplusplus.com
 template <typename T>
@@ -588,3 +631,20 @@ std::vector<T> vectorDifference(const std::vector<T> &model,
 
     return result;
 }
+
+inline std::string
+quoteText(const std::string &text)
+{
+    return "`" + text + "`";
+}
+
+template <typename T> void
+destructThenFree(void *const p)
+{
+    if (p) {
+        static_cast<T *>(p)->~T();
+        free(static_cast<T *>(p));
+    }
+}
+
+bool test64bitZZConversions();

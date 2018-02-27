@@ -2,6 +2,7 @@
 
 #include <sstream>
 #include <string>
+#include <cassert>
 
 #include <util/onions.hh>
 
@@ -114,22 +115,71 @@ private:
     const std::string identifier_name;
 };
 
-// Do not derive this from AbstractException; their handling is too
-// divergent and we don't want to miss cases in catch graphs.
-class SynchronizationException {
+class ErrorPacketException {
+    const std::string file_name;
+    const uint64_t line_number;
+    const std::string msg;
+    const unsigned int error_code;
+    const std::string sql_state;
+
 public:
-    SynchronizationException(const std::string &file_name,
-                             unsigned long line_number,
-                             const std::string &details)
-        : error(TextMessageError(file_name, line_number, details)) {}
-    ~SynchronizationException() {}
+    ErrorPacketException(const std::string &file_name, uint64_t line_number,
+                         const std::string &msg, unsigned int error_code,
+                         const std::string &sql_state)
+        : file_name(file_name), line_number(line_number), msg(msg),
+          error_code(error_code), sql_state(sql_state)
+    {
+        assert(sql_state.length() == 5);
+    }
 
-    std::string to_string() const;
+    std::string getMessage() const
+    {
+        return "(" + file_name + ", " + std::to_string(line_number)
+               + ")\n" + msg + "\n";
+    }
 
-private:
-    const TextMessageError error;
+    unsigned int getErrorCode() const {return error_code;}
+    std::string getSQLState() const {return sql_state;}
 };
 
-std::ostream &operator<<(std::ostream &out,
-                         const SynchronizationException &error);
+#define TEST_GenericPacketException(test, msg)                  \
+{                                                               \
+    if (false == (test)) {                                      \
+        throw ErrorPacketException(__FILE__, __LINE__, (msg),   \
+                                   0xfff, "fail1");             \
+    }                                                           \
+}
 
+#define FAIL_GenericPacketException(msg)                        \
+    TEST_GenericPacketException(false, msg)                     \
+
+#define TEST_ErrPkt(test, msg)                                  \
+    TEST_GenericPacketException((test), (msg))
+
+class SchemaFailure : public AbstractException {
+public:
+    SchemaFailure(const std::string &file_name, int line_number)
+        : AbstractException(file_name, line_number) {}
+    std::string to_string() const {return "schema failure";}
+};
+
+#define TEST_SchemaFailure(test)                    \
+{                                                   \
+    if (!(test)) {                                  \
+        throw SchemaFailure(__FILE__, __LINE__);    \
+    }                                               \
+}
+
+class KillZoneFailure : public AbstractException {
+public:
+    KillZoneFailure(const std::string &file_name, int line_number)
+        : AbstractException(file_name, line_number) {}
+    std::string to_string() const {return "kill zone failure";}
+};
+
+#define TEST_KillZoneFailure(test)                  \
+{                                                   \
+    if (!(test)) {                                  \
+        throw KillZoneFailure(__FILE__, __LINE__);  \
+    }                                               \
+}

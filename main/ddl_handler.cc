@@ -1,45 +1,60 @@
+#include <csignal>
+
 #include <main/ddl_handler.hh>
 #include <main/rewrite_util.hh>
 #include <main/rewrite_main.hh>
 #include <main/alter_sub_handler.hh>
 #include <main/dispatcher.hh>
 #include <main/macro_util.hh>
+#include <main/metadata_tables.hh>
 #include <parser/lex_util.hh>
 
+#include <util/yield.hpp>
+
 class CreateTableHandler : public DDLHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps) const
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &pre) const
     {
-        const std::string db_name =
-            lex->select_lex.table_list.first->db;
-        TEST_DatabaseDiscrepancy(db_name, a.getDatabaseName());
-        const std::string table =
-            lex->select_lex.table_list.first->table_name;
+        assert(a.deltas.size() == 0);
+
+        TEST_DatabaseDiscrepancy(pre.dbname, a.getDatabaseName());
         LEX *const new_lex = copyWithTHD(lex);
 
+        TEST_Text(DB_TYPE_INNODB == lex->create_info.db_type->db_type,
+                  "InnoDB is the only supported ENGINE")
+
+        // partitioning information is not currently printed by our LEX
+        // stringifications algorithms which leads to a truncated query
+        TEST_Text(NULL == lex->part_info,
+                  "CryptDB does not support partitioning");
+
         //TODO: support for "create table like"
-        if (lex->create_info.options & HA_LEX_CREATE_TABLE_LIKE) {
-            cryptdb_err() << "No support for create table like yet. "
-                          << "If you see this, please implement me";
-        }
+        TEST_Text(
+                !(lex->create_info.options & HA_LEX_CREATE_TABLE_LIKE),
+                "No support for create table like yet. "
+                "If you see this, please implement me");
 
         // Create the table regardless of 'IF NOT EXISTS' if the table
         // doesn't exist.
-        if (false == a.tableMetaExists(db_name, table)) {
+        if (false == a.tableMetaExists(pre.dbname, pre.table)) {
             // TODO: Use appropriate values for has_sensitive and has_salt.
             std::unique_ptr<TableMeta> tm(new TableMeta(true, true));
 
             // -----------------------------
-            //         Rewrite TABLE       
+            //         Rewrite TABLE
             // -----------------------------
             // HACK.
             // > We know that there is only one table.
-            // > We also know that rewrite_table_list is going to fail to
-            // find this table in 'a'.
+            // > We do not currently support CREATE + SELECT syntax
+            //   ! CREATE TABLE t2 SELECT * FROM t1;
+            // > We also know that Analysis does not have a reference to
+            //   the table as it depends on SchemaInfo.
             // > And we know that the table we want is tm with name table.
             // > This will _NOT_ gracefully handle a malformed CREATE TABLE
             // query.
-            assert(1 == new_lex->select_lex.table_list.elements);
+            TEST_Text(1 == new_lex->select_lex.table_list.elements,
+                      "we do not support multiple tables in a CREATE"
+                      " TABLE queries");
             // Take the table name straight from 'tm' as
             // Analysis::getAnonTableName relies on SchemaInfo.
             TABLE_LIST *const tbl =
@@ -48,38 +63,32 @@ class CreateTableHandler : public DDLHandler {
             new_lex->select_lex.table_list =
                 *oneElemListWithTHD<TABLE_LIST>(tbl);
 
+            // collect the keys (and their types) as they may affect the onion
+            // layout we use
+            const auto &key_data = collectKeyData(*lex);
+
             auto it =
                 List_iterator<Create_field>(lex->alter_info.create_list);
             new_lex->alter_info.create_list =
                 accumList<Create_field>(it,
-                    [&a, &ps, &tm] (List<Create_field> out_list,
-                                    Create_field *const cf) {
-                        return createAndRewriteField(a, ps, cf, tm.get(),
-                                                     true, out_list);
+                    [&a, &tm, &key_data] (List<Create_field> out_list,
+                                          Create_field *const cf) {
+                        return createAndRewriteField(a, cf, tm.get(),
+                                                     true, key_data, out_list);
                 });
 
             // -----------------------------
             //         Rewrite INDEX
             // -----------------------------
-            auto key_it =
-                List_iterator<Key>(lex->alter_info.key_list);
-            new_lex->alter_info.key_list =
-                accumList<Key>(key_it,
-                    [&tm, &a] (List<Key> out_list, Key *const key)
-                    {
-                        auto keys = rewrite_key(*tm.get(), key, a);
-                        out_list.concat(vectorToListWithTHD(keys));
-
-                        return out_list;
-                    });
+            highLevelRewriteKey(*tm.get(), *lex, new_lex, a);
 
             // -----------------------------
-            //         Update TABLE       
+            //         Update TABLE
             // -----------------------------
             a.deltas.push_back(std::unique_ptr<Delta>(
                             new CreateDelta(std::move(tm),
-                                            a.getDatabaseMeta(db_name),
-                                            IdentityMetaKey(table))));
+                                            a.getDatabaseMeta(pre.dbname),
+                                            IdentityMetaKey(pre.table))));
         } else { // Table already exists.
 
             // Make sure we aren't trying to create a table that
@@ -87,10 +96,10 @@ class CreateTableHandler : public DDLHandler {
             const bool test =
                 lex->create_info.options & HA_LEX_CREATE_IF_NOT_EXISTS;
             TEST_TextMessageError(test,
-                                  "Table " + table + " already exists!");
+                                "Table " + pre.table + " already exists!");
 
             // -----------------------------
-            //         Rewrite TABLE       
+            //         Rewrite TABLE
             // -----------------------------
             new_lex->select_lex.table_list =
                 rewrite_table_list(lex->select_lex.table_list, a);
@@ -106,29 +115,39 @@ class CreateTableHandler : public DDLHandler {
             // with the credit card field every time the server boots)
         }
 
-        return new_lex;
+        return new DDLQueryExecutor(*new_lex, std::move(a.deltas));
     }
 };
 
-// > TODO: mysql permits a single ALTER TABLE command to invoke _multiple_
-//   and _different_ subcommands.
-//   ie, ALTER TABLE t ADD COLUMN x integer, ADD INDEX i (z);
-//   Currently we do not support mixed operations.
-//   > Must guarentee that rewrite_table_list is only called one time.
-//   > If we drop Keys and Columns in the same query the order is probably
-//     going to get changed.
+// mysql does not support indiscriminate add-drops
+// ie,
+//      mysql> create table pk (x integer);
+//      Query OK, 0 rows affected (0.09 sec)
+//
+//      mysql> alter table pk drop column x, add column x integer,
+//                            drop column x;
+//      ERROR 1091 (42000): Can't DROP 'x'; check that column/key exists
+//
+//      mysql> alter table pk drop column x, add column x integer;
+//      Query OK, 0 rows affected (0.03 sec)
+//      Records: 0  Duplicates: 0  Warnings: 0
 class AlterTableHandler : public DDLHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps) const
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &pre) const
     {
-        assert(sub_dispatcher->canDo(lex));
+        assert(a.deltas.size() == 0);
+
+        TEST_Text(sub_dispatcher->canDo(lex),
+                  "your ALTER TABLE query may require at least one"
+                  " unsupported feature");
         const std::vector<AlterSubHandler *> &handlers =
             sub_dispatcher->dispatch(lex);
+        assert(handlers.size() > 0);
 
         LEX *new_lex = copyWithTHD(lex);
 
         for (auto it : handlers) {
-            new_lex = it->transformLex(a, new_lex, ps);
+            new_lex = it->transformLex(a, new_lex);
         }
 
         // -----------------------------
@@ -139,7 +158,7 @@ class AlterTableHandler : public DDLHandler {
         new_lex->select_lex.table_list =
             rewrite_table_list(new_lex->select_lex.table_list, a, true);
 
-        return new_lex;
+        return new DDLQueryExecutor(*new_lex, std::move(a.deltas));
     }
 
     const std::unique_ptr<AlterDispatcher> sub_dispatcher;
@@ -149,16 +168,18 @@ public:
 };
 
 class DropTableHandler : public DDLHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *lex,
-                                  const ProxyState &ps) const
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *lex, const Preamble &pre) const
     {
-        LEX *final_lex = rewrite(a, lex, ps);
-        update(a, lex, ps);
+        assert(a.deltas.size() == 0);
 
-        return final_lex;
+        LEX *const final_lex = rewrite(a, lex);
+        update(a, lex);
+
+        return new DDLQueryExecutor(*final_lex, std::move(a.deltas));
     }
     
-    LEX *rewrite(Analysis &a, LEX *lex, const ProxyState &ps) const
+    LEX *rewrite(Analysis &a, LEX *lex) const
     {
         LEX *const new_lex = copyWithTHD(lex);
         new_lex->select_lex.table_list =
@@ -167,7 +188,7 @@ class DropTableHandler : public DDLHandler {
         return new_lex;
     }
 
-    void update(Analysis &a, LEX *lex, const ProxyState &ps) const
+    void update(Analysis &a, LEX *lex) const
     {
         TABLE_LIST *tbl = lex->select_lex.table_list.first;
         for (; tbl; tbl = tbl->next_local) {
@@ -190,10 +211,13 @@ class DropTableHandler : public DDLHandler {
 };
 
 class CreateDBHandler : public DDLHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *const lex,
-                                  const ProxyState &ps) const
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *const lex, const Preamble &pre)
+            const
     {
-        const std::string dbname =
+        assert(a.deltas.size() == 0);
+
+        const std::string &dbname =
             convert_lex_str(lex->name);
         if (false == a.databaseMetaExists(dbname)) {
             std::unique_ptr<DatabaseMeta> dm(new DatabaseMeta());
@@ -207,48 +231,102 @@ class CreateDBHandler : public DDLHandler {
                                 "Database " + dbname + " already exists!");
         }
 
-        return copyWithTHD(lex);
+        return new DDLQueryExecutor(*copyWithTHD(lex), std::move(a.deltas));
     }
 };
 
 class ChangeDBHandler : public DDLHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *const lex,
-                                  const ProxyState &ps) const
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *const lex, const Preamble &pre)
+            const
     {
-        return copyWithTHD(lex);
+        assert(a.deltas.size() == 0);
+        return new SimpleExecutor();
     }
 };
 
 class DropDBHandler : public DDLHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *const lex,
-                                  const ProxyState &ps) const
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *const lex, const Preamble &pre)
+            const
     {
-        const std::string dbname =
-            convert_lex_str(lex->name);
-        DatabaseMeta &dm = a.getDatabaseMeta(dbname);
+        assert(a.deltas.size() == 0);
+
+        const std::string &dbname = convert_lex_str(lex->name);
+        const DatabaseMeta &dm = a.getDatabaseMeta(dbname);
         a.deltas.push_back(std::unique_ptr<Delta>(
                                     new DeleteDelta(dm, a.getSchema())));
 
-        return copyWithTHD(lex);
+        return new DDLQueryExecutor(*copyWithTHD(lex), std::move(a.deltas));
     }
 };
 
 class LockTablesHandler : public DDLHandler {
-    virtual LEX *rewriteAndUpdate(Analysis &a, LEX *const lex,
-                                  const ProxyState &ps) const
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *const lex, const Preamble &pre)
+            const
     {
+        assert(a.deltas.size() == 0);
+
         LEX *const new_lex = copyWithTHD(lex);
         new_lex->select_lex.table_list =
             rewrite_table_list(lex->select_lex.table_list, a);
 
-        return new_lex;
+        return new DDLQueryExecutor(*new_lex, std::move(a.deltas));
     }
 };
 
-LEX *DDLHandler::transformLex(Analysis &a, LEX *lex,
-                              const ProxyState &ps) const
+class CreateIndexHandler : public DDLHandler {
+    virtual AbstractQueryExecutor *
+        rewriteAndUpdate(Analysis &a, LEX *const lex, const Preamble &pre)
+            const
+    {
+        assert(a.deltas.size() == 0);
+
+        LEX *const new_lex = copyWithTHD(lex);
+
+        // rewrite table
+        new_lex->select_lex.table_list =
+            rewrite_table_list(lex->select_lex.table_list, a);
+
+        TEST_DatabaseDiscrepancy(pre.dbname, a.getDatabaseName());
+        TableMeta const &tm = a.getTableMeta(pre.dbname, pre.table);
+
+        highLevelRewriteKey(tm, *lex, new_lex, a);
+
+        return new DDLQueryExecutor(*new_lex, std::move(a.deltas));
+    }
+};
+
+static std::string
+empty_if_null(const char *const p)
 {
-    return this->rewriteAndUpdate(a, lex, ps);
+    if (p) return std::string(p);
+
+    return std::string("");
+}
+
+AbstractQueryExecutor *DDLHandler::
+transformLex(Analysis &a, LEX *lex) const
+{
+    assert(a.deltas.size() == 0);
+
+    AssignOnce<std::string> db;
+    AssignOnce<std::string> table;
+    if (lex->select_lex.table_list.first) {
+        db = empty_if_null(lex->select_lex.table_list.first->db);
+        table =
+            empty_if_null(lex->select_lex.table_list.first->table_name);
+    } else {
+        db =  "", table = "";
+    }
+
+    auto executor =
+        this->rewriteAndUpdate(a, lex, Preamble(db.get(), table.get()));
+
+    assert(a.deltas.size() == 0);
+
+    return executor;
 }
 
 // FIXME: Add test to make sure handler added successfully.
@@ -278,5 +356,59 @@ SQLDispatcher *buildDDLDispatcher()
     h = new LockTablesHandler();
     dispatcher->addHandler(SQLCOM_LOCK_TABLES, h);
 
+    h = new CreateIndexHandler();
+    dispatcher->addHandler(SQLCOM_CREATE_INDEX, h);
+
     return dispatcher;
 }
+
+std::pair<AbstractQueryExecutor::ResultType, AbstractAnything *>
+DDLQueryExecutor::
+nextImpl(const ResType &res, const NextParams &nparams)
+{
+    reenter(this->corot) {
+        yield {
+            {
+                uint64_t embedded_completion_id;
+                TEST_ErrPkt(
+                    deltaOutputBeforeQuery(nparams.ps.getEConn(),
+                                           nparams.original_query,
+                                           this->new_query, this->deltas,
+                                           CompletionType::DDL,
+                                           &embedded_completion_id),
+                    "deltaOutputBeforeQuery failed for DDL");
+                this->embedded_completion_id = embedded_completion_id;
+            }
+
+            // execute the rewritten query
+            return CR_QUERY_AGAIN(this->new_query);
+        }
+        TEST_ErrPkt(res.success(), "DDL query failed");
+        // save the results so we can return them to the client
+        this->ddl_res = res;
+
+        yield {
+            return CR_QUERY_AGAIN(
+                " INSERT INTO " + MetaData::Table::remoteQueryCompletion() +
+                "   (embedded_completion_id, completion_type) VALUES"
+                "   (" + std::to_string(this->embedded_completion_id.get()) + ","
+                "    '"+TypeText<CompletionType>::toText(CompletionType::Onion)+"'"
+                "   );");
+        }
+        TEST_ErrPkt(res.success(), "failed issuing ddl completion");
+
+        // execute the original query against the embedded database
+        // > this is a ddl query so do not put it into a transaction
+        TEST_ErrPkt(nparams.ps.getEConn()->execute(nparams.original_query),
+                   "Failed to execute DDL query against embedded database!");
+
+        TEST_ErrPkt(deltaOutputAfterQuery(nparams.ps.getEConn(), this->deltas,
+                                          this->embedded_completion_id.get()),
+                   "deltaOuputAfterQuery failed for DDL");
+
+        yield return CR_RESULTS(this->ddl_res.get());
+    }
+
+    assert(false);
+}
+

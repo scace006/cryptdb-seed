@@ -109,7 +109,7 @@ int main(int argc, char **argv)
 
     std::string username("");
     std::string password("");
-    bool exec = true;
+    // bool exec = true;
 
     while(1)
     {
@@ -123,18 +123,22 @@ int main(int argc, char **argv)
                 do_display_help(argv[0]);
             case 'f':
                 {
+                    /*
                     Import import(optarg);
                     if(exec == true){
                         ConnectionInfo ci("localhost", username, password);
                         const std::string master_key = "2392834";
-                        ProxyState ps(ci, "/var/lib/shadow-mysql",
-                                      master_key);
+                        SharedProxyState shared_ps(ci,
+                                                "/var/lib/shadow-mysql",
+                                                master_key);
+                        ProxyState ps(shared_ps);
 
                         // Execute queries
                         import.executeQueries(ps);
                     } else {
                         import.printOutOnly();
                     }
+                    */
                 }
                 break;
             case 'p':
@@ -148,7 +152,7 @@ int main(int argc, char **argv)
                 (void)threads;
                 break;
             case 'n':
-                exec = false;
+                // exec = false;
                 break;
             case '?':
                 break;

@@ -92,6 +92,9 @@ static bool handle_line(ProxyState& ps, const std::string& q, bool pp=true)
   }
 
   static SchemaCache schema_cache;
+  (void)schema_cache;
+  // FIXME
+  /*
   try {
       const std::string &default_db =
           getDefaultDatabaseForConnection(ps.getConn());
@@ -102,19 +105,21 @@ static bool handle_line(ProxyState& ps, const std::string& q, bool pp=true)
                     << std::endl;
       }
       return epi_result.res_type.success();
-  } catch (const SynchronizationException &e) {
-      std::cout << e << std::endl;
-      return true;
+  }  catch (const SynchronizationException &e) {
+      std::cout << e;
+      return false;
   } catch (const AbstractException &e) {
-      std::cout << e << std::endl;
+      std::cout << "exception: " << e;
       return true;
-  }  catch (const CryptDBError &e) {
-      std::cout << "Low level error: " << e.msg << std::endl;
+  } catch (const CryptDBError &e) {
+      std::cout << "low level exception: " << e.msg << std::endl;
       return true;
   } catch (const std::runtime_error &e) {
       std::cout << "Unexpected Error: " << e.what() << std::endl;
       return false;
   }
+  */
+  return false;
 }
 
 int
@@ -133,7 +138,8 @@ main(int ac, char **av)
 
     ConnectionInfo ci("localhost", "root", "letmein");
     const std::string master_key = "2392834";
-    ProxyState ps(ci, av[1], master_key);
+    SharedProxyState shared_ps(ci, av[1], master_key, determineSecurityRating());
+    ProxyState ps(shared_ps);
     const std::string create_db =
         "CREATE DATABASE IF NOT EXISTS " + std::string(av[2]);
     if (!handle_line(ps, create_db, false)) {
