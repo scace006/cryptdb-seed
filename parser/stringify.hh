@@ -569,7 +569,11 @@ static inline std::ostream&
 operator<<(std::ostream &out, LEX &lex)
 {
     String s;
+  
     THD *t = current_thd;
+    std::cout << "entered command\n"; 
+    std::cout << lex.sql_command;
+    std::cout << "\n";
 
     switch (lex.sql_command) {
     case SQLCOM_SELECT:
@@ -940,7 +944,9 @@ operator<<(std::ostream &out, LEX &lex)
         /* placeholders to make analysis work.. */
         out << ".. type " << lex.sql_command << " query ..";
         break;
-
+    case SQLCOM_END:
+        out << "";
+        break;
     default:
         thrower() << "unhandled sql command " << lex.sql_command;
     }
