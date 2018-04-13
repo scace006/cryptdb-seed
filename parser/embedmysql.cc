@@ -104,6 +104,7 @@ query_parse::query_parse(const std::string &db, const std::string &q)
     if (strncmp(toLowerCase(q).c_str(), "cryptdb", 7) == 0) {
         cout << "creating annotations \n";
         annot = new Annotation(q);
+        cout << annot;
         return;
     } else {
         annot = NULL;

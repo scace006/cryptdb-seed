@@ -945,8 +945,9 @@ operator<<(std::ostream &out, LEX &lex)
         out << ".. type " << lex.sql_command << " query ..";
         break;
     case SQLCOM_END:
-        out << "";
+        out << "do 0";
         break;
+        
     default:
         thrower() << "unhandled sql command " << lex.sql_command;
     }

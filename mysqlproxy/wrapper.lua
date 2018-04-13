@@ -9,10 +9,49 @@ local client            = nil
 -- Interception points provided by mysqlproxy
 --
 
+-- nessesary for data analysis
+freq = {}
+database = ""
+total_fake = 0
+
+function load_meta()
+    local file = io.open('mysqlproxy/freqs.txt', 'r')
+    local line_key = ""    
+    for line in file:lines() do
+        if string.sub(line, 1, 2) == "  " then
+            -- print('adding values')
+            local index = 1
+            local val_key = ""
+            for w in string.gmatch(line, "[%w']+") do
+                if index == 1 then
+                    val_key = w
+                else
+                    print(line_key, freq[line_key], val_key)                    
+                    freq[line_key][val_key] = tonumber(w)
+                end
+                print(w)                
+                index = index + 1
+            end
+        elseif string.sub(line, 1, 10) == "total_fake" then
+            for w in string.gmatch(line, "(%w+)") do
+                total_fake = tonumber(w)
+            end
+        else
+            -- print('adding key', line)
+            line_key = line
+            freq[line_key] = {}
+        end
+
+    end
+    file:close()
+end
+
+print('loading meta')
+load_meta()
+print('finished loading meta')
 
 function read_auth()
     client = proxy.connection.client.src.name 
-
     -- Use this instead of connect_server(), to get server name
     dprint("Connected " .. proxy.connection.client.src.name)
     CryptDB.connect(proxy.connection.client.src.name,
@@ -38,6 +77,133 @@ function read_query(packet)
     else
         print("read_query: " .. err)
         return proxy.PROXY_SEND_QUERY
+    end
+end
+
+function smooth(query)
+    local cols = {} 
+    local vals = {}
+    local lower = string.lower(query)
+    local to_insert = 0
+    local new_query = query
+    
+    -- print_val(proxy)
+
+    if string.sub(lower, 1, 3) == 'use' then
+        for w in string.gmatch(query, "(%w+)") do
+            database = string.gsub(w, "%s+", "")
+        end
+    end
+
+    if string.sub(lower, 1, 6) == 'insert' then
+        local file = io.open('mysqlproxy/freqs.txt', 'w')    
+        local tablename = string.gsub(string.match(query, "(%w-%()"), "(%()", "")
+        local index = 0
+        for w in string.gmatch(query, "(%(.-%))") do
+            -- print(w)
+            if index == 0 then
+                -- print("parsing fields")
+                for col in string.gmatch(w, "([,%(%s]%w-[%s,%)])") do
+                    local cleaned = string.gsub(col, "([,%(%)%s])", "")
+                    table.insert(cols, cleaned)
+                end
+            end
+            
+            if index > 0 then
+                -- print("parsing values")              
+                for val in string.gmatch(w, "([,%(%s][%w%x']+[%s,%)])") do
+                    -- print(val)                                        
+                    local cleaned = string.gsub(val, "([,%(%)%s])", "")
+                    table.insert(vals, cleaned)
+                end
+            end
+            index = index + 1
+        end
+
+        
+        for k, col in pairs(cols) do
+
+            local count = 1
+            local val = vals[k]
+            local key = database.."_"..tablename.."_"..col
+
+            if col == 'illness' then
+            
+                if freq[key] == nil then
+                    freq[key] = {}
+                    freq[key]["max"] = count
+                    freq[key][val] = count
+                else 
+                    max = freq[key]["max"]
+                
+                    if freq[key][val] == nil then
+                        freq[key][val] = count
+                    else
+                        count = freq[key][val]
+                        count = count + 1
+                        freq[key][val] = count
+                    end
+
+                    print(val, 'max' ,max, 'current count' , freq[key][val])                
+
+                    if max < freq[key][val] then
+                        freq[key]["max"] = freq[key][val]
+                    end
+
+                    to_insert = max - count
+
+                    if to_insert > 0 then
+                        freq[key][val] = count + to_insert
+                    end
+                
+                end
+
+            end
+        end
+        
+        -- print('file created')
+        
+        for i, v in pairs(freq) do
+            file:write(i..'\n')
+            for j, count in pairs(v) do
+                file:write("  "..j..' '..count..'\n')
+                print(j, count)
+            end
+        end
+
+        print("to fake insert", to_insert)   
+        
+        total_fake = total_fake + to_insert
+
+        value_query = "("
+        col_query = "("
+        for k, val in pairs(vals) do
+            col_query = col_query..cols[k]..","
+            value_query = value_query..val..","
+        end
+
+        col_query = col_query.."type) "
+        -- value_query = string.sub(value_query, 1, string.len(value_query) - 0)
+        new_query = "INSERT INTO "..tablename..col_query.."VALUES "..value_query.."'r')"
+        for i = 1, to_insert, 1 do
+            new_query = new_query..","..value_query.."null)"
+            -- freq[key][val] = count + to_insert            
+        end
+        file:write('total_fake'..' '..total_fake..'\n')
+        file:close()    
+    end
+
+    print("final query", new_query)
+    print("total fake inserted", total_fake)    
+
+    return new_query
+end
+
+function print_val(tab) 
+    if type(tab) == 'table' then
+        for k, val in pairs(tab) do
+            print(k, val)
+        end
     end
 end
 
@@ -132,11 +298,12 @@ function read_query_real(packet)
     local query = string.sub(packet, 2)
     print("================================================")
     printred("QUERY: ".. query)
-
     if string.byte(packet) == proxy.COM_INIT_DB then
         query = "USE `" .. query .. "`"
     end
 
+    query = smooth(query)
+    
     if string.byte(packet) == proxy.COM_INIT_DB or
        string.byte(packet) == proxy.COM_QUERY then
         status, error_msg =
@@ -159,7 +326,7 @@ end
 function read_query_result_real(inj)
     local query = inj.query:sub(2)
     prettyNewQuery(query)
-
+    
     if skip == true then
         skip = false
         return
