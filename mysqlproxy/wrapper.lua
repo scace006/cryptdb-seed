@@ -5,10 +5,7 @@ local proto = assert(require("mysql.proto"))
 local g_want_interim    = nil
 local skip              = false
 local client            = nil
---
 -- Interception points provided by mysqlproxy
---
-
 
 function read_auth()
     client = proxy.connection.client.src.name 
@@ -27,6 +24,7 @@ function read_auth()
 end
 
 function disconnect_client()
+    print("Disconnect called")
     dprint("Disconnected " .. proxy.connection.client.src.name)
     CryptDB.disconnect(proxy.connection.client.src.name)
 end
@@ -52,10 +50,7 @@ function read_query_result(inj)
 end
 
 
---
 -- Pretty printing
---
-
 DEMO = true
 
 COLOR_END = '\027[00m'
@@ -102,9 +97,7 @@ function makePrintable(s)
            news = news .. '?'
         end
     end
-
     return news
-
 end
 
 function prettyNewQuery(q)
@@ -114,14 +107,10 @@ function prettyNewQuery(q)
             return
         end
     end
- 
     print(greentext("NEW QUERY: ")..makePrintable(q))
 end
 
---
 -- Helper functions
---
-
 function dprint(x)
     if os.getenv("CRYPTDB_PROXY_DEBUG") then
         print(x)
@@ -132,6 +121,14 @@ function read_query_real(packet)
     local query = string.sub(packet, 2)
     print("================================================")
     printred("QUERY: ".. query)
+    
+    --
+    --CUSTOM CODE START
+    --detect and rewrite CREATE TABLE queries
+    query = create_table_checker(query)
+    --
+    --CUSTOM CODE END
+    --
 
     if string.byte(packet) == proxy.COM_INIT_DB then
         query = "USE `" .. query .. "`"
@@ -155,6 +152,34 @@ function read_query_real(packet)
         print("unexpected packet type " .. string.byte(packet))
     end
 end
+
+--
+--CUSTOM CODE START
+--Function that detects and rewrites CREATE TABLE queries
+function create_table_checker(query)
+    local words = {}
+    local word
+    
+    --tokenize query by spaces, and insert into table
+    for word in query:gmatch("%S+") do
+        table.insert(words, word)
+    end
+    --print(orangetext("Parse Query:"))
+    --for i, word in ipairs(words) do print(i, word) end
+    
+    if #words > 0 then
+        if string.match(words[1]:lower(), "create") then
+            if string.match(words[2]:lower(), "table") then
+                query = query:sub(1, -2) .. ", fake INT DEFAULT 0)"
+                --print(orangetext("New Query: ")..query)
+            end
+        end
+    end
+    return query
+end
+--
+--CUSTOM CODE END
+--
 
 function read_query_result_real(inj)
     local query = inj.query:sub(2)
@@ -260,8 +285,45 @@ function next_handler(from, status, client, fields, rows, affected_rows,
 
         if #rfields > 0 then
             proxy.response.resultset = { fields = rfields, rows = rrows }
+            
+            --
+            --CUSTOM CODE START
+            --
+            --find which field is the fake
+            local ind = -1
+            for i, field in ipairs(rfields) do
+                if string.match(field.name, "fake") then
+                    --print("fake is attribute: "..i)
+                    ind = i
+                end
+            end
+            
+            --populate a list of rows to delete
+            local del = {}
+            for x, row in ipairs(rrows) do
+                for y, val in ipairs(row) do
+                    --io.write(val.." \t")
+                    if y == ind then
+                        if string.match(val, "1") then
+                            table.insert(del, x)
+                            break
+                        end
+                    end
+                end
+            end
+            
+            --delete the specified rows from the table
+            local offset = 0
+            for i, counter in pairs(del) do
+                table.remove(rrows, counter-offset)
+                offset = offset+1     --account for shifts when table re-indexes
+            end
+            --
+            --CUSTOM CODE END
+            --
+            
         end
-
+        
         proxy.response.type             = proxy.MYSQLD_PACKET_OK
         proxy.response.affected_rows    = raffected_rows
         proxy.response.insert_id        = rinsert_id
