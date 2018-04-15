@@ -312,6 +312,9 @@ function next_handler(from, status, client, fields, rows, affected_rows,
                 end
             end
             
+            --remove fake column from showing in resultset
+            table.remove(rfields, ind)
+      
             --delete the specified rows from the table
             local offset = 0
             for i, counter in pairs(del) do
