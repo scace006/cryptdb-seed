@@ -1,7 +1,7 @@
 Medical_records_illness
-  'cancer' 3479
-  'pneumonia' 3474
-  max 3479
-  'flu' 3475
-  'headache' 3479
-total_fake 3483
+  'cancer' 4997
+  'pneumonia' 4997
+  max 4997
+  'flu' 4997
+  'headache' 4997
+total_fake 2

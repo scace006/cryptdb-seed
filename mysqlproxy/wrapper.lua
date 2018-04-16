@@ -14,12 +14,14 @@ freq = {}
 database = ""
 total_fake = 0
 
+
+-- loads table frequency data by parsing the file 
+-- stores values in the freq variable
 function load_meta()
     local file = io.open('mysqlproxy/freqs.txt', 'r')
     local line_key = ""    
     for line in file:lines() do
         if string.sub(line, 1, 2) == "  " then
-            -- print('adding values')
             local index = 1
             local val_key = ""
             for w in string.gmatch(line, "[%w']+") do
@@ -37,7 +39,6 @@ function load_meta()
                 total_fake = tonumber(w)
             end
         else
-            -- print('adding key', line)
             line_key = line
             freq[line_key] = {}
         end
@@ -46,9 +47,8 @@ function load_meta()
     file:close()
 end
 
-print('loading meta')
+print('loading frequencies')
 load_meta()
-print('finished loading meta')
 
 function read_auth()
     client = proxy.connection.client.src.name 
@@ -80,39 +80,45 @@ function read_query(packet)
     end
 end
 
-function smooth(query)
+
+-- Smooths out data on insert queries
+-- so that there's a flat histogram of the each value in a column
+function lazy_active_smooth(query)
     local cols = {} 
     local vals = {}
     local lower = string.lower(query)
     local to_insert = 0
     local new_query = query
     
-    -- print_val(proxy)
-
+    -- looks for `use` keyword to get the table name.
     if string.sub(lower, 1, 3) == 'use' then
         for w in string.gmatch(query, "(%w+)") do
             database = string.gsub(w, "%s+", "")
         end
     end
 
+    -- looks for `insert` keyword to parse and modify the insert query
     if string.sub(lower, 1, 6) == 'insert' then
         local file = io.open('mysqlproxy/freqs.txt', 'w')    
+        
+        -- gets the table name
         local tablename = string.gsub(string.match(query, "(%w-%()"), "(%()", "")
         local index = 0
+        
+        -- splits the query by parentheses
         for w in string.gmatch(query, "(%(.-%))") do
-            -- print(w)
+
+            -- parses fields being inserted            
             if index == 0 then
-                -- print("parsing fields")
                 for col in string.gmatch(w, "([,%(%s]%w-[%s,%)])") do
                     local cleaned = string.gsub(col, "([,%(%)%s])", "")
                     table.insert(cols, cleaned)
                 end
             end
-            
+
+            -- parses values being inserted              
             if index > 0 then
-                -- print("parsing values")              
                 for val in string.gmatch(w, "([,%(%s][%w%x']+[%s,%)])") do
-                    -- print(val)                                        
                     local cleaned = string.gsub(val, "([,%(%)%s])", "")
                     table.insert(vals, cleaned)
                 end
@@ -120,49 +126,61 @@ function smooth(query)
             index = index + 1
         end
 
-        
+        -- traverses the column names to modify the query accordingly
         for k, col in pairs(cols) do
-
-            local count = 1
-            local val = vals[k]
-            local key = database.."_"..tablename.."_"..col
-
-            if col == 'illness' then
             
+            -- TODO: change this hard coded value, the DBMA should specify which columns to watch
+            -- right now only one column per table is supported
+            if col == 'illness' then
+                local count = 1
+                local val = vals[k]
+                local key = database.."_"..tablename.."_"..col
+                
+                -- inititate the freq value
                 if freq[key] == nil then
                     freq[key] = {}
                     freq[key]["max"] = count
                     freq[key][val] = count
+
+                -- adjust current frequencies
                 else 
                     max = freq[key]["max"]
-                
+
+                    -- create new insert query
+                    value_query = "("
+                    col_query = "("
+                    for k, val in pairs(vals) do
+                        col_query = col_query..cols[k]..","
+                        value_query = value_query..val..","
+                    end
+            
+                    col_query = col_query.."type) "
+                    new_query = "INSERT INTO "..tablename..col_query.."VALUES "..value_query.."'r')"
+
+                    -- if the frequency value does not exist then, upadte to the currrent max count
                     if freq[key][val] == nil then
-                        freq[key][val] = count
+                        to_insert = max - count
+                        -- in reality the frequency of the value does not need to be stored, only the max frequency but we keep it for sanity check
+                        freq[key][val] = count + to_insert                        
+                        for i = 1, to_insert, 1 do
+                            new_query = new_query..","..value_query.."null)"
+                        end
+                    -- if the frequency exist then add fake to all the other values and increase count by 1
                     else
-                        count = freq[key][val]
-                        count = count + 1
-                        freq[key][val] = count
+                        for k, v in pairs(freq[key]) do
+                            freq[key][k] = freq[key][k] + 1
+                            if k ~= val and k ~= 'max' then
+                                new_query = new_query..","..string.gsub(value_query, val, k).."null)"
+                            end
+                        end
                     end
-
-                    print(val, 'max' ,max, 'current count' , freq[key][val])                
-
-                    if max < freq[key][val] then
-                        freq[key]["max"] = freq[key][val]
-                    end
-
-                    to_insert = max - count
-
-                    if to_insert > 0 then
-                        freq[key][val] = count + to_insert
-                    end
-                
+                    print(val, 'max', max, 'current count' , freq[key][val])                
                 end
-
             end
         end
         
-        -- print('file created')
-        
+    
+        -- saving frequencies to a file
         for i, v in pairs(freq) do
             file:write(i..'\n')
             for j, count in pairs(v) do
@@ -175,29 +193,16 @@ function smooth(query)
         
         total_fake = total_fake + to_insert
 
-        value_query = "("
-        col_query = "("
-        for k, val in pairs(vals) do
-            col_query = col_query..cols[k]..","
-            value_query = value_query..val..","
-        end
-
-        col_query = col_query.."type) "
-        -- value_query = string.sub(value_query, 1, string.len(value_query) - 0)
-        new_query = "INSERT INTO "..tablename..col_query.."VALUES "..value_query.."'r')"
-        for i = 1, to_insert, 1 do
-            new_query = new_query..","..value_query.."null)"
-            -- freq[key][val] = count + to_insert            
-        end
         file:write('total_fake'..' '..total_fake..'\n')
         file:close()    
     end
 
     print("final query", new_query)
-    print("total fake inserted", total_fake)    
 
+    -- returns modifed query
     return new_query
 end
+
 
 function print_val(tab) 
     if type(tab) == 'table' then
@@ -301,8 +306,9 @@ function read_query_real(packet)
     if string.byte(packet) == proxy.COM_INIT_DB then
         query = "USE `" .. query .. "`"
     end
-
-    query = smooth(query)
+    
+    -- flat histogram in case of insertions
+    query = lazy_active_smooth(query)
     
     if string.byte(packet) == proxy.COM_INIT_DB or
        string.byte(packet) == proxy.COM_QUERY then
