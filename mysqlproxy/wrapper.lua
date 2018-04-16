@@ -154,8 +154,8 @@ function lazy_active_smooth(query)
                         value_query = value_query..val..","
                     end
             
-                    col_query = col_query.."type) "
-                    new_query = "INSERT INTO "..tablename..col_query.."VALUES "..value_query.."'r')"
+                    col_query = col_query.."fakse) "
+                    new_query = "INSERT INTO "..tablename..col_query.."VALUES "..value_query.."0)"
 
                     -- if the frequency value does not exist then, upadte to the currrent max count
                     if freq[key][val] == nil then
@@ -163,14 +163,14 @@ function lazy_active_smooth(query)
                         -- in reality the frequency of the value does not need to be stored, only the max frequency but we keep it for sanity check
                         freq[key][val] = count + to_insert                        
                         for i = 1, to_insert, 1 do
-                            new_query = new_query..","..value_query.."null)"
+                            new_query = new_query..","..value_query.."1)"
                         end
                     -- if the frequency exist then add fake to all the other values and increase count by 1
                     else
                         for k, v in pairs(freq[key]) do
                             freq[key][k] = freq[key][k] + 1
                             if k ~= val and k ~= 'max' then
-                                new_query = new_query..","..string.gsub(value_query, val, k).."null)"
+                                new_query = new_query..","..string.gsub(value_query, val, k).."1)"
                             end
                         end
                     end
