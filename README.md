@@ -38,3 +38,11 @@ This repor is a fork of the original cryptdb  https://github.com/CryptDB/cryptdb
 * (Optional) To install the webview, run **sudo cp -r ~cryptdb_supp/webview/ /var/www/html/**
 	* This will copy the webview directory to the apache root
 	* To use webview, launch the browser, and go to **localhost/webview**
+	
+#### 5. Using cryptdb
+* To run cryptdb, there should be a cdbserver.sh and cdbclient.sh file inside the directory
+	* Run the server file with **./cdbserver.sh** first
+	* Run the client file with **./cdbclient.sh** after
+* To exit from cryptdb, make sure that all clients disconnect before terminating the server
+	* To disconnect the client, simply enter **quit**
+	* To terminate the server use ctrl-c
