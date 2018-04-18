@@ -42,7 +42,7 @@ This repor is a fork of the original cryptdb  https://github.com/CryptDB/cryptdb
 #### 5. Using cryptdb
 * To run cryptdb, there should be a cdbserver.sh and cdbclient.sh file inside the directory
 	* Run the server file with **./cdbserver.sh** first
-	* Run the client file with **./cdbclient.sh** after
+	* Run the client file with **./cdbclient.sh** in a seperate window
 * To exit from cryptdb, make sure that all clients disconnect before terminating the server
 	* To disconnect the client, simply enter **quit**
 	* To terminate the server use ctrl-c
