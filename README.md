@@ -32,6 +32,7 @@ This repor is a fork of the original cryptdb  https://github.com/CryptDB/cryptdb
 * In terminal, navigate to cryptdb/scripts/ and run **sudo gedit install.rb**
 	* Remove all of line 40, and the backslash from line 39
 * Navigate back to the cryptdb folder, and run **sudo scripts/install.rb .**
+	* Do not omit the dot at the end of the command
 	* This will install cryptdb
 	* In order for cryptdb to work with its default configurations, MySQL password should be **letmein**
 * (Optional) To install the webview, run **sudo cp -r ~cryptdb_supp/webview/ /var/www/html/**
