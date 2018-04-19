@@ -19,6 +19,12 @@ total_fake = 0
 function load_meta()
     local file = io.open('mysqlproxy/freqs.txt', 'r')
     local line_key = ""    
+    if file == nil then
+        file = io.open('mysqlproxy/freqs.txt', 'w')
+        file:close()
+        file = io.open('mysqlproxy/freqs.txt', 'r')
+    end
+        
     for line in file:lines() do
         if string.sub(line, 1, 2) == "  " then
             local index = 1
@@ -476,24 +482,26 @@ function next_handler(from, status, client, fields, rows, affected_rows,
             
             --populate a list of rows to delete
             local del = {}
-            for x, row in ipairs(rrows) do
+            for i, row in ipairs(rrows) do
                 for y, val in ipairs(row) do
-                    --io.write(val.." \t")
+                    --io.write("("..y..")"..val.." \t")
                     if y == ind then
                         if string.match(val, "1") then
-                            table.insert(del, x)
+                            table.insert(del, i)
                             break
                         end
                     end
                 end
-                print("")
             end
-            print("")
+            
+            if ind >= 0 then
+                table.remove(rfields, ind)
+            end
             
             --delete the specified rows from the table
             local offset = 0
-            for i, counter in pairs(del) do
-                table.remove(rrows, counter-offset)
+            for i, val in pairs(del) do
+                table.remove(rrows, val-offset)
                 offset = offset+1     --account for shifts when table re-indexes
             end
             --
