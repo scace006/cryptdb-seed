@@ -476,24 +476,24 @@ function next_handler(from, status, client, fields, rows, affected_rows,
             
             --populate a list of rows to delete
             local del = {}
-            for x, row in ipairs(rrows) do
+            for i, row in ipairs(rrows) do
                 for y, val in ipairs(row) do
-                    --io.write(val.." \t")
+                    --io.write("("..y..")"..val.." \t")
                     if y == ind then
                         if string.match(val, "1") then
-                            table.insert(del, x)
+                            table.insert(del, i)
                             break
                         end
                     end
                 end
-                print("")
             end
-            print("")
-            
+
+            --remove fake column from showing in the result set
+            table.remove(rfields, ind)
             --delete the specified rows from the table
             local offset = 0
-            for i, counter in pairs(del) do
-                table.remove(rrows, counter-offset)
+            for i, val in pairs(del) do
+                table.remove(rrows, val-offset)
                 offset = offset+1     --account for shifts when table re-indexes
             end
             --
